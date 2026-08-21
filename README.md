@@ -46,7 +46,7 @@ Windows/公司代理环境的常见问题，二选一解决：
 
 在 `.env` 中取消注释 `HF_ENDPOINT=https://hf-mirror.com`，走国内镜像。
 
-**3. 修改了 knowledge_base.txt，但 rag.py 回答还是旧内容**
+**3. 修改了 docs/ 里的知识库文件，但 rag.py 回答还是旧内容**
 
 Chroma 索引是持久化的，不会自动感知源文件变化。更新知识库后，
 删掉 `chroma_db` 目录再运行即可重建索引：
@@ -56,13 +56,26 @@ rmdir /s /q chroma_db    # Windows
 python rag.py
 ```
 
+## 知识库支持格式（docs/ 目录）
+
+| 格式 | 说明 |
+| --- | --- |
+| `.txt` / `.md` | 直接放入即可 |
+| `.pdf` | 直接放入即可 |
+| `.docx` | Word 文档，直接放入即可 |
+| `.csv` | Excel 请**另存为 CSV** 后放入（原生 .xlsx 支持留待后续阶段） |
+
+> `docs/` 目录有文件时优先加载 docs/；为空或不存在时回退加载 `knowledge_base.txt`。
+> 每个知识库文件的来源文件名会作为元数据保存，回答时会标注「来源」。
+
 ## 代码结构
 
 | 文件 | 作用 |
 | --- | --- |
 | `main.py` | 普通问答：加载配置 → 创建模型 → 定义提示词 → 组合成链 → 运行 |
-| `rag.py` | RAG 问答：普通问答 + 知识库检索（检索增强生成） |
-| `knowledge_base.txt` | 教学用示例知识库（RAG 的检索来源） |
+| `rag.py` | RAG 问答：多格式知识库 → 切分 → 嵌入 → Chroma 检索 → 生成 |
+| `knowledge_base.txt` | 单文件知识库（docs/ 为空时的回退来源） |
+| `docs/` | 多格式知识库目录（txt/md/pdf/docx/csv） |
 | `requirements.txt` | 依赖清单 |
 | `.env.example` | 环境变量模板（复制为 `.env` 后填写） |
 
@@ -81,12 +94,12 @@ RAG = 检索（Retrieval）+ 增强（Augmented）+ 生成（Generation），
 
 | 环节 | 对应代码 | 作用 |
 | --- | --- | --- |
-| 加载文档 | `open("knowledge_base.txt")` | 读取知识来源 |
-| 切分 | `RecursiveCharacterTextSplitter` | 长文本切小块，便于精确检索 |
+| 加载文档 | `load_documents()` + `DirectoryLoader` | 扫描 docs/，按扩展名路由到对应 Loader |
+| 切分 | `RecursiveCharacterTextSplitter` | 长文本切小块，`split_documents` 保留来源 metadata |
 | 嵌入 | `HuggingFaceEmbeddings` | 用本地开源模型把文本转成向量 |
 | 存储 | `Chroma` | 向量库，索引落盘到 `./chroma_db`，重启后直接加载无需重建 |
 | 检索 | `vector_store.as_retriever(k=2)` | 按相似度找最相关片段 |
-| 增强 | 把 `{context}` 塞进提示词 | 让模型"带着资料"作答 |
+| 增强 | 把 `{context}` 塞进提示词 | 让模型"带着资料"作答，并标注来源 |
 
 **建议体验**：先用 `main.py` 问"星辰科技是哪年成立的"（模型不知道，会编造），
 再用 `rag.py` 问同样的问题，可以看到它基于知识库给出正确回答。

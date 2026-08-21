@@ -21,6 +21,8 @@ LangChain 教学项目 · 可改进方向与思路笔记
    - 用 LangChain 的文档加载器按目录批量加载：
      DirectoryLoader / PyPDFLoader / CSVLoader / JSONLoader
    - 每种格式用对应的 Loader，而不是自己 open() 解析
+   - 注意：新版 langchain-community（0.4+）已移除 DirectoryLoader 的 loader_map 参数，
+     本项目已改为手动 os.walk 遍历 + LOADER_MAP 路由（见第五部分第 2 步）
 
 3. 更优的切分策略（Chunking 优化指南）
    【切分大小的影响】
@@ -159,11 +161,24 @@ LangChain 教学项目 · 可改进方向与思路笔记
    - 若想换 FAISS：pip install faiss-cpu langchain-community，
      用 FAISS.from_texts(chunks, embedding) + save_local / load_local
    -如果以后想修改knowledge_base.txt，必须修改完成之后手动删除索引重建,代码为;
-   rmdir /s /q chroma_db
-   python rag.py
+   Remove-Item -Recurse -Force chroma_db
 
+[已完成] 第 2 步：多格式加载（第一阶段）
+   - 已在 rag.py 实施：docs/ 目录 + os.walk 手动遍历 + LOADER_MAP 按扩展名路由
+   - 背景：新版 langchain-community（0.4+）移除了 DirectoryLoader 的 loader_map 参数，
+     故改为自己写循环遍历目录（for root, _, files in os.walk），不依赖框架版本 API
+   - LOADER_MAP 结构：(Loader 类, 参数)，如 .txt/.md -> TextLoader(encoding="utf-8")
+   - 支持 .txt / .md / .pdf / .docx / .csv，不支持的类型打印提示并跳过
+   - 编码：文本类 Loader 显式传 encoding="utf-8"，避免 Windows 默认 GBK 解码中文报错
+     （UnicodeDecodeError: 'gbk' codec can't decode byte ...）
+   - 切分统一用 RecursiveCharacterTextSplitter，split_documents 保留来源 metadata
+   - 回答时标注来源（format_docs 读取 metadata["source"]）
+   - 已知边界：.xlsx 需另存为 CSV；切分策略未按格式区分（留待 2.5 步）
+   - 注意：docs/ 有文件时优先加载 docs/；为空时回退 knowledge_base.txt
 
-[待做] 第 2 步：多格式加载：PDF/Word/网页 接入 DirectoryLoader
+[待做] 第 2.5 步：多格式切分差异化（第二阶段）
+   - 按 metadata["source"] 的扩展名路由切分器：表格按行切、Markdown 按标题切等
+   - 原生 .xlsx 支持（UnstructuredExcelLoader 或 pandas）
 [待做] 第 3 步：加 BM25 混合检索 + bge-reranker 重排序     （检索准确率明显提升）
 [待做] 第 4 步：视频字幕/语音转写接入，先做最简单的 srt 解析
 [待做] 第 5 步：建立 assets/logo 素材目录规范          （为海报生成做准备）

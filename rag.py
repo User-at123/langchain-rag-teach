@@ -1,7 +1,6 @@
-"""LangChain RAG 教学示例：检索增强生成。
+"""LangChain RAG 教学示例：检索增强生成（第一阶段：支持多格式知识库）。
 
-与 main.py（普通问答）相比，RAG 多了一个"知识库"环节：
-    加载文档 → 切分 → 嵌入 → 检索 → 生成
+流程：加载文档（txt/md/pdf/docx/csv）→ 切分 → 嵌入 → Chroma 检索 → 生成
 """
 
 import os
@@ -22,21 +21,69 @@ if os.getenv("USE_INSECURE_SSL") == "1":
     os.environ["HF_HUB_DISABLE_SSL_VERIFY"] = "1"
 
 from langchain_chroma import Chroma
+from langchain_community.document_loaders import (
+    CSVLoader,
+    Docx2txtLoader,
+    PyPDFLoader,
+    TextLoader,
+)
+from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# ========== 1. 加载文档 ==========
-# 读取本地知识库文件（教学用，实际项目中可能是 PDF、网页等）
-with open("knowledge_base.txt", encoding="utf-8") as f:
-    text = f.read()
-print(f"已加载知识库，共 {len(text)} 字")
+# ========== 1. 加载文档（支持多格式） ==========
+# 规则：docs/ 目录里有文件 → 按扩展名路由到对应 Loader 加载全部；
+#       docs/ 不存在或为空 → 回退加载单个 knowledge_base.txt（兼容原教学流程）
+# 注意：新版 langchain-community（0.4+）移除了 DirectoryLoader 的 loader_map 参数，
+#       所以这里改为手动遍历目录 + 按扩展名路由，逻辑更直白，也更好教学
+DOCS_DIR = os.getenv("DOCS_DIR", "./docs")
+
+# 扩展名 → (Loader 类, 传给它的参数) 的路由表（清晰直观）
+# 为什么传 encoding="utf-8"：Windows 默认用 GBK 打开文本文件，
+# 而知识库文件一般保存为 UTF-8（含中文），不指定就会报 UnicodeDecodeError
+LOADER_MAP = {
+    ".txt": (TextLoader, {"encoding": "utf-8"}),      # 纯文本
+    ".md": (TextLoader, {"encoding": "utf-8"}),       # Markdown
+    ".pdf": (PyPDFLoader, {}),                        # PDF（二进制，无编码问题）
+    ".docx": (Docx2txtLoader, {}),                    # Word（二进制，无编码问题）
+    ".csv": (CSVLoader, {"encoding": "utf-8"}),       # CSV（Excel 请另存为 CSV）
+}
+
+
+def load_documents():
+    """加载知识库文档，返回 Document 列表（每个带 page_content 和 metadata）。"""
+    if os.path.isdir(DOCS_DIR) and any(os.listdir(DOCS_DIR)):
+        docs = []
+        # 递归遍历 docs/ 下所有文件，按扩展名挑选对应 Loader 逐个加载
+        for root, _, files in os.walk(DOCS_DIR):
+            for name in files:
+                ext = os.path.splitext(name)[1].lower()  # 取出扩展名，如 ".pdf"
+                entry = LOADER_MAP.get(ext)
+                if entry is None:
+                    print(f"跳过不支持的文件类型: {name}")
+                    continue
+                loader_cls, loader_kwargs = entry  # 拆出 Loader 类和它的参数
+                path = os.path.join(root, name)
+                # 每个文件加载出一个或多个 Document（自带 metadata={"source": 路径}）
+                docs.extend(loader_cls(path, **loader_kwargs).load())
+        return docs
+    else:
+        # 回退路径：兼容旧版单文件教学
+        with open("knowledge_base.txt", encoding="utf-8") as f:
+            return [Document(page_content=f.read(), metadata={"source": "knowledge_base.txt"})]
+
+
+documents = load_documents()
+print(f"加载了 {len(documents)} 个文档")
 
 # ========== 2. 切分（Chunking） ==========
 # 长文本切小块，便于精确检索；chunk_overlap 让相邻块有重叠，避免语义被切断
+# 第一阶段统一用 RecursiveCharacterTextSplitter（通用切分器）
+# 注意：用 split_documents 而不是 split_text —— 这样切分后的块会保留来源 metadata
 splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=50)
-chunks = splitter.split_text(text)
+chunks = splitter.split_documents(documents)
 print(f"切分成 {len(chunks)} 个片段")
 
 # ========== 3. 嵌入 + 存储（Chroma 持久化） ==========
@@ -58,7 +105,7 @@ if os.path.exists(CHROMA_DIR):
 # 第一次运行：创建索引并保存到磁盘
 else:
     print("首次运行：创建向量索引并保存到磁盘 ...")
-    vector_store = Chroma.from_texts(
+    vector_store = Chroma.from_documents(
         chunks,
         embedding=embeddings,
         persist_directory=CHROMA_DIR,
@@ -86,8 +133,12 @@ prompt = ChatPromptTemplate.from_messages([
 
 # ========== 6. 组合成链 ==========
 def format_docs(docs):
-    """把检索到的文档列表拼成一段干净文本，作为参考资料。"""
-    return "\n\n".join(doc.page_content for doc in docs)
+    """把检索到的文档列表拼成一段干净文本，并标注来源文件名。"""
+    parts = []
+    for doc in docs:
+        source = doc.metadata.get("source", "未知来源")
+        parts.append(f"[来源: {source}]\n{doc.page_content}")
+    return "\n\n".join(parts)
 
 # 并行分支：
 #   - context：先从输入里取出 question 字符串（检索器只接受字符串），交给 retriever 检索，
