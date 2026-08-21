@@ -1,6 +1,9 @@
 # 密钥配置，绝不提交
 .env
 
+# 向量索引（体积大、可随时重建，不提交）
+chroma_db/
+
 # Python
 __pycache__/
 *.pyc

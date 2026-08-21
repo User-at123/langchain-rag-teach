@@ -21,8 +21,8 @@ if os.getenv("HF_ENDPOINT"):
 if os.getenv("USE_INSECURE_SSL") == "1":
     os.environ["HF_HUB_DISABLE_SSL_VERIFY"] = "1"
 
+from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -39,13 +39,30 @@ splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=50)
 chunks = splitter.split_text(text)
 print(f"切分成 {len(chunks)} 个片段")
 
-# ========== 3. 嵌入 + 存储 ==========
-# 把每个片段转成向量，存入内存向量库（教学用；生产可用 FAISS/Chroma 等）
+# ========== 3. 嵌入 + 存储（Chroma 持久化） ==========
+# 把每个片段转成向量，存入 Chroma 向量库，索引会保存到磁盘（./chroma_db 目录）
 # 注意：DeepSeek 没有 Embedding API，所以用本地开源模型（首次运行会自动下载，约 100MB）
 embeddings = HuggingFaceEmbeddings(
     model_name=os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5"),
 )
-vector_store = InMemoryVectorStore.from_texts(chunks, embedding=embeddings)
+
+CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma_db")
+
+# 第二次及以后运行：索引已在磁盘上，直接加载，跳过重新嵌入（几秒搞定）
+if os.path.exists(CHROMA_DIR):
+    print("检测到已有向量索引，直接加载（无需重新嵌入）")
+    vector_store = Chroma(
+        embedding_function=embeddings,
+        persist_directory=CHROMA_DIR,
+    )
+# 第一次运行：创建索引并保存到磁盘
+else:
+    print("首次运行：创建向量索引并保存到磁盘 ...")
+    vector_store = Chroma.from_texts(
+        chunks,
+        embedding=embeddings,
+        persist_directory=CHROMA_DIR,
+    )
 
 # ========== 4. 创建检索器 ==========
 # 根据问题找出最相关的片段，k=2 表示取最相关的 2 个

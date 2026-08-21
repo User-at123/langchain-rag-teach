@@ -1,6 +1,6 @@
 ================================================================
 LangChain 教学项目 · 可改进方向与思路笔记
-（基于当前项目：DeepSeek + bge-small-zh 本地嵌入 + InMemoryVectorStore）
+（基于当前项目：DeepSeek + bge-small-zh 本地嵌入 + Chroma 持久化向量库）
 ================================================================
 
 一、大数据量知识库：加载与切分的提速方案
@@ -22,12 +22,39 @@ LangChain 教学项目 · 可改进方向与思路笔记
      DirectoryLoader / PyPDFLoader / CSVLoader / JSONLoader
    - 每种格式用对应的 Loader，而不是自己 open() 解析
 
-3. 更优的切分策略
-   - 调参：chunk_size（块大小）+ chunk_overlap（重叠）需要实验
-   - 结构化切分：MarkdownHeaderTextSplitter 按标题层级切，语义更完整
-   - 语义切分：SemanticChunker 按语义边界切，避免一句话被切断
-   - 父子切分（ParentDocumentRetriever）：小片段负责检索、
-     命中后返回所属的大段落作为上下文，兼顾"精准"和"完整"
+3. 更优的切分策略（Chunking 优化指南）
+   【切分大小的影响】
+   - 切太细（如 50 字）：语义断裂。"星辰科技成立于2015年"被切成两块，
+     问"哪年成立"只命中一半 -> 答错
+   - 切太粗（如 1000 字）：一个块塞多个不相关主题，向量被稀释，
+     区分度差 -> 噪声大，答不准
+   - 经验值：中文一般 200~800 字，chunk_overlap 防止一句话卡在边界被切断
+   - 判断方法：切完打印几个块看看——"一句话被拦腰切断"就调大 overlap；
+     "一个块里话题混杂"就调小 chunk_size
+   - 注意：改参数后必须删 chroma_db 重建索引才生效
+
+   【不同格式的切分器对照】
+   | 内容类型 | 推荐切分器 | 优势 |
+   | 普通文章/文档 | RecursiveCharacterTextSplitter（现状） | 通用够用 |
+   | Markdown/结构化 | MarkdownHeaderTextSplitter | 按标题层级切，章节不拆散 |
+   | 代码 | CodeSplitter | 按函数/类边界切 |
+   | PDF（有章节标题） | 先解析结构再按标题切 | 保留章节层级 |
+   | 表格/数据 | 一行或一个记录为一块 | 表格语义在"行" |
+   | 语义敏感文本 | SemanticChunker | 按语义边界切，块内主题一致，最慢但最好 |
+   | 任意（进阶） | ParentDocumentRetriever | 小片段检索（精准）+ 大段落上下文（完整） |
+
+   【切分与检索质量的关系】
+   - 检索质量 = 嵌入模型质量 x 切分质量 x 检索算法
+   - 切分决定"检索的最小单元"：命中准不准看块内是否完整语义；
+     答得全不全看返回块是否包含完整上下文
+   - 没有绝对最优参数，需要实验调参
+   - 第 3 步的 BM25 + 重排序可在一定程度上弥补切分不完美（先广召回再精排）
+
+   【当前项目的实验方法】
+   - 改 rag.py 中 splitter 参数后删 chroma_db 重建索引：
+     splitter = RecursiveCharacterTextSplitter(chunk_size=100, chunk_overlap=20)  # 更细
+     splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=100) # 更粗
+   - 用同一批问题分别测试，对比回答质量
 
 4. 检索质量增强
    - 混合检索：BM25 关键词检索 + 向量相似度检索，取并集再融合
@@ -127,11 +154,19 @@ LangChain 教学项目 · 可改进方向与思路笔记
 
 五、当前项目的最小升级路径（建议顺序）
 ----------------------------------------------------------------
-第 1 步：InMemoryVectorStore -> FAISS/Chroma        （半小时，立竿见影）
-第 2 步：多格式加载：PDF/Word/网页 接入 DirectoryLoader
-第 3 步：加 BM25 混合检索 + bge-reranker 重排序     （检索准确率明显提升）
-第 4 步：视频字幕/语音转写接入，先做最简单的 srt 解析
-第 5 步：建立 assets/logo 素材目录规范          （为海报生成做准备）
-第 6 步：FastAPI 封装 + 简单前端页面
-第 7 步：海报/文案生成模块（先做文案，再做图片；logo 用程序化叠加）
+[已完成] 第 1 步：InMemoryVectorStore -> Chroma
+   - 已在 rag.py 实施：索引落盘到 ./chroma_db，首次运行创建、之后直接加载，chroma_db中存储数据被切后的数据（元数据）以及向量数据和其对应的文本块。
+   - 若想换 FAISS：pip install faiss-cpu langchain-community，
+     用 FAISS.from_texts(chunks, embedding) + save_local / load_local
+   -如果以后想修改knowledge_base.txt，必须修改完成之后手动删除索引重建,代码为;
+   rmdir /s /q chroma_db
+   python rag.py
+
+
+[待做] 第 2 步：多格式加载：PDF/Word/网页 接入 DirectoryLoader
+[待做] 第 3 步：加 BM25 混合检索 + bge-reranker 重排序     （检索准确率明显提升）
+[待做] 第 4 步：视频字幕/语音转写接入，先做最简单的 srt 解析
+[待做] 第 5 步：建立 assets/logo 素材目录规范          （为海报生成做准备）
+[待做] 第 6 步：FastAPI 封装 + 简单前端页面
+[待做] 第 7 步：海报/文案生成模块（先做文案，再做图片；logo 用程序化叠加）
 ================================================================

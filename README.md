@@ -14,7 +14,7 @@ cp .env.example .env    # 然后编辑 .env，填入你的 DeepSeek API Key
 
 # 3. 运行
 python main.py    # 普通问答
-python rag.py     # RAG 问答（首次运行会下载嵌入模型，约 100MB）
+python rag.py     # RAG 问答（首次运行会下载嵌入模型并建索引，之后运行秒加载）
 ```
 
 ## 配置说明（.env）
@@ -25,6 +25,7 @@ python rag.py     # RAG 问答（首次运行会下载嵌入模型，约 100MB�
 | `OPENAI_BASE_URL` | DeepSeek 接口地址，默认已填好 |
 | `LLM_MODEL` | 对话模型，默认 `deepseek-chat`（也可填 `deepseek-reasoner`） |
 | `EMBEDDING_MODEL` | 嵌入模型，默认 `BAAI/bge-small-zh-v1.5`（本地开源模型） |
+| `CHROMA_DIR` | 向量索引存储目录，默认 `./chroma_db`（首次运行创建，之后直接加载） |
 | `HF_ENDPOINT` | 可选，HuggingFace 国内镜像（`https://hf-mirror.com`），加速/修复模型下载 |
 | `USE_INSECURE_SSL` | 可选，设为 `1` 可跳过 SSL 证书验证（仅教学用，修复证书报错） |
 
@@ -44,6 +45,16 @@ Windows/公司代理环境的常见问题，二选一解决：
 **2. 模型下载很慢或一直失败**
 
 在 `.env` 中取消注释 `HF_ENDPOINT=https://hf-mirror.com`，走国内镜像。
+
+**3. 修改了 knowledge_base.txt，但 rag.py 回答还是旧内容**
+
+Chroma 索引是持久化的，不会自动感知源文件变化。更新知识库后，
+删掉 `chroma_db` 目录再运行即可重建索引：
+```bash
+rmdir /s /q chroma_db    # Windows
+# 或 rm -rf chroma_db    # Mac/Linux
+python rag.py
+```
 
 ## 代码结构
 
@@ -73,7 +84,7 @@ RAG = 检索（Retrieval）+ 增强（Augmented）+ 生成（Generation），
 | 加载文档 | `open("knowledge_base.txt")` | 读取知识来源 |
 | 切分 | `RecursiveCharacterTextSplitter` | 长文本切小块，便于精确检索 |
 | 嵌入 | `HuggingFaceEmbeddings` | 用本地开源模型把文本转成向量 |
-| 存储 | `InMemoryVectorStore` | 向量库（教学用内存版，生产可用 FAISS/Chroma） |
+| 存储 | `Chroma` | 向量库，索引落盘到 `./chroma_db`，重启后直接加载无需重建 |
 | 检索 | `vector_store.as_retriever(k=2)` | 按相似度找最相关片段 |
 | 增强 | 把 `{context}` 塞进提示词 | 让模型"带着资料"作答 |
 
