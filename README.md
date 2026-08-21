@@ -1,0 +1,81 @@
+# LangChain 入门教学项目
+
+一个最简单的 LangChain 示例：把「提示词模板 + 模型」组合成一条链，实现一问一答。
+已适配 **DeepSeek API**（OpenAI 兼容接口）。
+
+## 快速开始
+
+```bash
+# 1. 安装依赖
+pip install -r requirements.txt
+
+# 2. 配置 API Key
+cp .env.example .env    # 然后编辑 .env，填入你的 DeepSeek API Key
+
+# 3. 运行
+python main.py    # 普通问答
+python rag.py     # RAG 问答（首次运行会下载嵌入模型，约 100MB）
+```
+
+## 配置说明（.env）
+
+| 变量 | 说明 |
+| --- | --- |
+| `OPENAI_API_KEY` | 你的 DeepSeek API Key |
+| `OPENAI_BASE_URL` | DeepSeek 接口地址，默认已填好 |
+| `LLM_MODEL` | 对话模型，默认 `deepseek-chat`（也可填 `deepseek-reasoner`） |
+| `EMBEDDING_MODEL` | 嵌入模型，默认 `BAAI/bge-small-zh-v1.5`（本地开源模型） |
+| `HF_ENDPOINT` | 可选，HuggingFace 国内镜像（`https://hf-mirror.com`），加速/修复模型下载 |
+| `USE_INSECURE_SSL` | 可选，设为 `1` 可跳过 SSL 证书验证（仅教学用，修复证书报错） |
+
+> **为什么嵌入不用 DeepSeek？** DeepSeek 目前不提供 Embedding API，所以 `rag.py`
+> 使用本地开源模型 `BAAI/bge-small-zh-v1.5`（中文效果好、体积小），首次运行自动下载，
+> 之后离线可用，也不消耗 API 额度。
+
+## 常见问题
+
+**1. 下载嵌入模型报 `SSL: CERTIFICATE_VERIFY_FAILED`**
+
+Windows/公司代理环境的常见问题，二选一解决：
+
+- 在 `.env` 中取消注释 `USE_INSECURE_SSL=1`（最快，仅教学用）
+- 或在命令行先执行 `set HF_ENDPOINT=https://hf-mirror.com` 再用国内镜像下载
+
+**2. 模型下载很慢或一直失败**
+
+在 `.env` 中取消注释 `HF_ENDPOINT=https://hf-mirror.com`，走国内镜像。
+
+## 代码结构
+
+| 文件 | 作用 |
+| --- | --- |
+| `main.py` | 普通问答：加载配置 → 创建模型 → 定义提示词 → 组合成链 → 运行 |
+| `rag.py` | RAG 问答：普通问答 + 知识库检索（检索增强生成） |
+| `knowledge_base.txt` | 教学用示例知识库（RAG 的检索来源） |
+| `requirements.txt` | 依赖清单 |
+| `.env.example` | 环境变量模板（复制为 `.env` 后填写） |
+
+## 学习要点（按 main.py 中的顺序）
+
+1. **`load_dotenv()`**：从 `.env` 读取配置，密钥不要写死在代码里。
+2. **`ChatOpenAI(...)`**：创建一个模型对象，`temperature` 控制回答的随机性。
+3. **`ChatPromptTemplate`**：提示词模板，用 `{变量}` 占位，运行时填充。
+4. **`prompt | llm`**：LangChain 的核心语法——用管道符把组件连成一条链。
+5. **`chain.invoke({...})`**：传入参数并执行整条链，得到回答。
+
+## RAG 学习要点（rag.py）
+
+RAG = 检索（Retrieval）+ 增强（Augmented）+ 生成（Generation），
+即"先查资料，再回答"。与 main.py 相比多出以下环节：
+
+| 环节 | 对应代码 | 作用 |
+| --- | --- | --- |
+| 加载文档 | `open("knowledge_base.txt")` | 读取知识来源 |
+| 切分 | `RecursiveCharacterTextSplitter` | 长文本切小块，便于精确检索 |
+| 嵌入 | `HuggingFaceEmbeddings` | 用本地开源模型把文本转成向量 |
+| 存储 | `InMemoryVectorStore` | 向量库（教学用内存版，生产可用 FAISS/Chroma） |
+| 检索 | `vector_store.as_retriever(k=2)` | 按相似度找最相关片段 |
+| 增强 | 把 `{context}` 塞进提示词 | 让模型"带着资料"作答 |
+
+**建议体验**：先用 `main.py` 问"星辰科技是哪年成立的"（模型不知道，会编造），
+再用 `rag.py` 问同样的问题，可以看到它基于知识库给出正确回答。
