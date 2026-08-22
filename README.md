@@ -60,13 +60,22 @@ python rag.py
 
 | 格式 | 说明 |
 | --- | --- |
-| `.txt` / `.md` | 直接放入即可 |
+| `.txt` | 直接放入即可 |
+| `.md` | 直接放入即可；按标题层级切分（章节不拆散） |
 | `.pdf` | 直接放入即可 |
 | `.docx` | Word 文档，直接放入即可 |
-| `.csv` | Excel 请**另存为 CSV** 后放入（原生 .xlsx 支持留待后续阶段） |
+| `.csv` | 直接放入即可；按行切分，一行一条记录 |
+| `.xlsx` | Excel，直接放入即可；按行切分，表头字段名会拼进每一行数据（2.6 步起） |
 
 > `docs/` 目录有文件时优先加载 docs/；为空或不存在时回退加载 `knowledge_base.txt`。
 > 每个知识库文件的来源文件名会作为元数据保存，回答时会标注「来源」。
+
+> **切分策略（2.5 步）**：不同格式语义单元不同，切分也按格式路由——
+> `.md` 按标题层级切（MarkdownHeaderTextSplitter），`.csv`/`.xlsx` 按行切（一行一条记录），
+> 其余格式（txt/pdf/docx）用通用切分器（RecursiveCharacterTextSplitter）。
+>
+> **表格处理（2.6 步）**：`.xlsx` 的第 1 行视为表头，数据行入库为 `字段名: 值` 形式
+> （如 `客户行业: 金融 | 客户名称: 华信银行`），避免表头行与数据行分离导致"问字段名拿不到值"。
 
 ## 代码结构
 
@@ -75,7 +84,7 @@ python rag.py
 | `main.py` | 普通问答：加载配置 → 创建模型 → 定义提示词 → 组合成链 → 运行 |
 | `rag.py` | RAG 问答：多格式知识库 → 切分 → 嵌入 → Chroma 检索 → 生成 |
 | `knowledge_base.txt` | 单文件知识库（docs/ 为空时的回退来源） |
-| `docs/` | 多格式知识库目录（txt/md/pdf/docx/csv） |
+| `docs/` | 多格式知识库目录（txt/md/pdf/docx/csv/xlsx） |
 | `requirements.txt` | 依赖清单 |
 | `.env.example` | 环境变量模板（复制为 `.env` 后填写） |
 
@@ -94,11 +103,11 @@ RAG = 检索（Retrieval）+ 增强（Augmented）+ 生成（Generation），
 
 | 环节 | 对应代码 | 作用 |
 | --- | --- | --- |
-| 加载文档 | `load_documents()` + `DirectoryLoader` | 扫描 docs/，按扩展名路由到对应 Loader |
-| 切分 | `RecursiveCharacterTextSplitter` | 长文本切小块，`split_documents` 保留来源 metadata |
+| 加载文档 | `load_documents()`：`os.walk` 遍历 + `LOADER_MAP` 路由 | 扫描 docs/，按扩展名路由到对应加载函数（txt/md/pdf/docx/csv/xlsx） |
+| 切分 | `split_documents_by_format()` 按格式路由 | 长文本切小块；.md 按标题切、.csv/.xlsx 按行切、其余通用切分 |
 | 嵌入 | `HuggingFaceEmbeddings` | 用本地开源模型把文本转成向量 |
 | 存储 | `Chroma` | 向量库，索引落盘到 `./chroma_db`，重启后直接加载无需重建 |
-| 检索 | `vector_store.as_retriever(k=2)` | 按相似度找最相关片段 |
+| 检索 | `vector_store.as_retriever(k=6)` | 按相似度找最相关片段；k 决定"回答视野"，列举类问题需要大 k（如"所有客户的行业"）。局限：万级数据靠调 k 无解，需结构化 RAG / Text-to-SQL（见 mindmap 核心概念 4） |
 | 增强 | 把 `{context}` 塞进提示词 | 让模型"带着资料"作答，并标注来源 |
 
 **建议体验**：先用 `main.py` 问"星辰科技是哪年成立的"（模型不知道，会编造），

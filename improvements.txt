@@ -35,13 +35,13 @@ LangChain 教学项目 · 可改进方向与思路笔记
      "一个块里话题混杂"就调小 chunk_size
    - 注意：改参数后必须删 chroma_db 重建索引才生效
 
-   【不同格式的切分器对照】
+   【不同格式的切分器对照】（本项目 2.5 步已实现其中 Markdown 与表格两项）
    | 内容类型 | 推荐切分器 | 优势 |
-   | 普通文章/文档 | RecursiveCharacterTextSplitter（现状） | 通用够用 |
-   | Markdown/结构化 | MarkdownHeaderTextSplitter | 按标题层级切，章节不拆散 |
+   | 普通文章/文档 | RecursiveCharacterTextSplitter | 通用够用（本项目现状：txt/pdf/docx） |
+   | Markdown/结构化 | MarkdownHeaderTextSplitter | 按标题层级切，章节不拆散（本项目已实现：.md） |
    | 代码 | CodeSplitter | 按函数/类边界切 |
    | PDF（有章节标题） | 先解析结构再按标题切 | 保留章节层级 |
-   | 表格/数据 | 一行或一个记录为一块 | 表格语义在"行" |
+   | 表格/数据 | 一行或一个记录为一块 | 表格语义在"行"（本项目已实现：.csv/.xlsx 按行入库） |
    | 语义敏感文本 | SemanticChunker | 按语义边界切，块内主题一致，最慢但最好 |
    | 任意（进阶） | ParentDocumentRetriever | 小片段检索（精准）+ 大段落上下文（完整） |
 
@@ -173,12 +173,48 @@ LangChain 教学项目 · 可改进方向与思路笔记
      （UnicodeDecodeError: 'gbk' codec can't decode byte ...）
    - 切分统一用 RecursiveCharacterTextSplitter，split_documents 保留来源 metadata
    - 回答时标注来源（format_docs 读取 metadata["source"]）
-   - 已知边界：.xlsx 需另存为 CSV；切分策略未按格式区分（留待 2.5 步）
+   - 说明：当时的已知边界（.xlsx 需另存为 CSV、切分策略未按格式区分）已在 2.5 步解决
    - 注意：docs/ 有文件时优先加载 docs/；为空时回退 knowledge_base.txt
 
-[待做] 第 2.5 步：多格式切分差异化（第二阶段）
-   - 按 metadata["source"] 的扩展名路由切分器：表格按行切、Markdown 按标题切等
-   - 原生 .xlsx 支持（UnstructuredExcelLoader 或 pandas）
+[已完成] 第 2.5 步：多格式切分差异化（第二阶段）
+   - 已在 rag.py 实施：切分阶段按扩展名路由切分器（split_documents_by_format）
+     * .md   -> MarkdownHeaderTextSplitter：按 #/##/### 标题层级切，标题保留、章节不拆散；
+                （注意：该切分器输入是字符串而非 Document，切出的块需手动补回 metadata["source"]）
+     * .csv/.xlsx -> 表格语义在"行"：加载时已按行拆成单个 Document，切分阶段直接透传不再切
+     * 其他（.txt/.pdf/.docx）-> RecursiveCharacterTextSplitter（chunk_size=200, chunk_overlap=50，保留）
+   - 原生 .xlsx 支持：不用 LangChain 的 UnstructuredExcelLoader（需重量级 unstructured 依赖），
+     用 openpyxl 自写 load_xlsx：每行一个 Document、单元格用 | 连接、跳过全空行、
+     metadata["source"] 标注「工作表名 + 行号」（如 "sample.xlsx [工作表: 产品价格表 第2行]"）
+   - 新增依赖：openpyxl
+   - 验证方式：删 chroma_db 重建后，用 chromadb 直接读索引（不联网、不加载嵌入模型，
+     避免 HuggingFaceEmbeddings 初始化联网卡死）确认 sample.md 按标题切成 4 块、
+     sample.xlsx 按行入库 8 条（产品价格表 4 行 + 客户案例 4 行，含表头行，2.6 步已改进）
+[已完成] 第 2.6 步：xlsx 表头拼接（修复"问字段名拿不到值"的 bug）
+   - 背景：2.5 步按行切表后，表头行（字段名）和数据行（值）被拆成不同 Document，
+     问"客户行业是什么"时检索命中表头行——只有字段名没有值，答"具体内容未显示"
+   - 已在 rag.py 实施：load_xlsx 升级——第 1 行视为表头，数据行拼接为
+     "字段名: 值 | 字段名: 值"（如 "客户行业: 金融 | 客户名称: 华信银行 | ..."），
+     表头不再单独入库；跳过全空行、跳过与表头重复的行；
+     无表头的表（表头全空）退化为原 | 连接行为
+   - 原理：让数据行"自包含"字段名，检索命中数据行就能直接拿到值，不用跨块猜
+   - 验证结果：加载 7 个文档（md 1 + xlsx 6）、切分 10 个片段（md 4 + xlsx 6）；
+     问"客户行业有哪些"正确回答"华信银行，所属行业：金融"
+   - 注意：加载/切分逻辑变化后必须删 chroma_db 重建索引才生效
+[已完成] 第 2.7 步：检索参数调优（修复"列举类问题答不全"）
+   - 背景：检索器 k=2 只返回最相关 2 个片段，问"所有客户的行业"只召回 1 条案例行，
+     模型答"仅有一条客户案例：华信银行（金融）"
+   - 试错：先试 MMR 检索（search_type="mmr", k=3, fetch_k=20）——它按"相关+多样"平衡，
+     把结构相似的 3 条客户案例行当"重复"去重只留 1 条，多出的名额给了 md 里无关块，仍答不全
+   - 定稿：普通相似度检索 + k=6，3 条案例行相关性都高，全部进候选
+   - 验证：问"所有客户的行业有哪些？" → 完整列出华信银行（金融）、优品超市（零售）、明德学院（教育）
+   - 注意：检索参数变化**不需要**重建 chroma_db（只影响查询，不影响索引内容）
+   - 与第 3 步的关系：数据量变大后靠调大 k 会引入噪声，需 BM25 混合检索广召回 + reranker 精排
+   - 已知边界（V7.8 记录，暂不改代码）：k=6 只是当前 10 个片段知识库的调优值，不是通用解。
+     "列举所有 / 汇总 / 统计"类问题需要全量访问，不属于 Top-k 检索的舒适区。
+     一万客户时两种崩法：k 太小漏召回；k 调到 1 万则提示词 token 超限 + 检索噪声爆炸。
+     三档正解：整表引用（几百行）→ 分批聚合（几千~几万行）→ 结构化 RAG / Text-to-SQL
+     （生产级 1 万+：客户数据进数据库，问题转 SQL 返回聚合结果，向量检索只负责定位哪张表/哪个条件）。
+     结论：k=6 保留为"事实查询"教学配置；数据量真实增长到万级时走 Text-to-SQL 升级
 [待做] 第 3 步：加 BM25 混合检索 + bge-reranker 重排序     （检索准确率明显提升）
 [待做] 第 4 步：视频字幕/语音转写接入，先做最简单的 srt 解析
 [待做] 第 5 步：建立 assets/logo 素材目录规范          （为海报生成做准备）
