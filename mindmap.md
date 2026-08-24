@@ -62,14 +62,24 @@ LangChain 教学项目
 ├── V7.8 认知边界记录（纯文档，无代码改动）
 │   ├── k=6 只是当前 10 个片段知识库的调优值，不是通用解
 │   ├── "列举/聚合"类问题 ≠ Top-k 检索问题（见核心概念 4）
-│   └── 三档正解：整表引用 → 分批聚合 → Text-to-SQL（生产级）
+│   ├── 三档正解：整表引用 → 分批聚合 → Text-to-SQL（生产级）
+│   └── 补充：引用"上一轮导出结果"的推理 ≠ 检索（走 memory，见核心概念 5 / 第 9 步）
+│
+├── V7.9 混合检索 + 重排序（第三阶段，待提交）
+│   ├── 单一向量检索 → BM25 + 向量 + RRF 融合 + bge-reranker 精排
+│   ├── k 的职责：从"回答视野"（V7.7）降级为"粗筛漏斗"，精排后定视野
+│   ├── 坑：langchain-retrievers 包装不上 → 手写 RRFRetriever / RerankerRetriever
+│   └── 坑：BM25 中文必须接 jieba 分词（preprocess_func 参数）
 │
 └── V8+ 未来规划（见 improvements.txt）
-    ├── 3   BM25 混合检索 + bge-reranker 重排序
+    ├── 3   已完成（V7.9）：BM25 混合检索 + bge-reranker 重排序
     ├── 4   视频字幕 srt / 语音转写接入
-    ├── 5   assets/logo 素材目录规范
-    ├── 6   FastAPI 封装 + 前端页面
-    └── 7   海报 / 文案生成（logo 程序化叠加）
+    ├── 5   Text-to-SQL + 路由器（问题分流：向量 vs SQL；SQLite 起步 → MySQL）
+    ├── 6   FastAPI 封装 + 前端页面（封装完整能力，含 SQL 路由）
+    ├── 7   assets/logo 素材目录规范
+    ├── 8   海报 / 文案生成（logo 程序化叠加）
+    ├── 9   多轮记忆 + 跨轮状态（路由三路：vector / sql / memory）
+    └── 10  Agent 工具化（query_sql / retrieve_vector / read_memory 自主编排）
 ```
 
 ---
@@ -321,17 +331,75 @@ LOADER_MAP = {
 治标不治本；真正支撑一万客户的是数据入库 + 问题转 SQL（结构化 RAG），
 属于架构级升级，等数据量真实增长时再做（见核心概念 4）
 
+**补充：引用前面结果的推理 ≠ 检索（多轮对话场景）**
+- 场景：第 1 轮问"所有客户的信息"，走 SQL 全量导出；
+  第 2 轮说"基于刚才导出的第 3 条分析一下"
+- 关键认知：第 2 轮**不该走向量检索**——知识库里没有"上一轮的导出结果"，
+  检索永远命中不了；这是对上一轮结构化结果的推理，应走 **memory / 跨轮状态**
+- 三项技术：①会话记忆（session_id + ChatMessageHistory）②跨轮状态管理
+  （SQL 结果暂存会话，路由优先查状态）③Agent 工具化
+  （query_sql / retrieve_vector / read_memory 自主编排）
+- 归入规划：第 9 步（多轮记忆 + 跨轮状态，CLI 先验证再接 FastAPI）、
+  第 10 步（Agent 工具化）；路由器升级为三路：vector / sql / memory
+
+---
+
+### V7.9 混合检索 + 重排序（第三阶段，待提交）
+
+**改动内容**
+- 单一向量检索（`retriever = vector_store.as_retriever(k=6)`）→ 三环节流水线：
+  **BM25 关键词检索 → 向量检索 → RRF 融合 → bge-reranker 精排 Top 6**
+- k 的职责变化（承接 V7.7）：k 从"回答视野"降级为"粗筛漏斗"——
+  两路都召回 50，精排后只留 6 条进提示词，最终视野仍是 6
+
+**为什么手写 RRF 和 Reranker（关键教学决策）**
+- 官方 `EnsembleRetriever` / `CrossEncoderReranker` 位于独立包 langchain-retrievers，
+  但该包国内镜像（清华/阿里）未同步、PyPI 也无法安装 → 装不上
+- 改为手写两个类（各约 20 行）：
+  * `RRFRetriever`：互惠排名融合，score(d) = Σ 1/(k + rank_i(d))，只比排名不比分数
+  * `RerankerRetriever`：sentence-transformers CrossEncoder（BAAI/bge-reranker-base）
+    懒加载，候选逐条与问题算相关度，重排取 top_n
+- 教学收益：把官方"黑盒"讲透，且不依赖装不上的包（类似 V7.5 自写 load_xlsx 的思路）
+
+**使用工具**
+- `BM25Retriever`（langchain_community.retrievers）+ rank-bm25（算法）+ jieba（分词）
+- `RRFRetriever` / `RerankerRetriever`（手写 BaseRetriever 子类）
+- 新增依赖：rank-bm25、jieba
+
+**踩坑记录（重要）**
+- 坑 1：BM25 默认按空格分词，中文整句会被当成一个 token，检索直接失效
+  → 必须传 jieba 分词器：`preprocess_func=lambda t: list(jieba.cut(t))`
+- 坑 2：本项目 langchain-community 版 BM25Retriever 的参数名是 `preprocess_func`，
+  新版独立包才叫 `tokenizer`——照抄新版文档会报 TypeError
+- 坑 3：langchain-retrievers 独立包在国内镜像/PyPI 均无法安装 → 手写方案
+- 坑 4：reranker 模型首次运行才下载（懒加载设计），import 阶段不会联网卡住
+
+**验证结果**
+- BM25 问"华信银行"精准命中金融案例行；向量问"给零售客户推荐什么"语义命中优品超市
+- RRF 融合后 3 条客户案例行全部进 Top 候选
+- bge-reranker 精排后 3 条案例行稳居前 3，噪声（主营/团队介绍）被压后
+- 回归：问"所有客户的行业有哪些？" → 完整回答零售、金融、教育 ✅
+
+**注意事项**
+- 检索参数变化**不需要**重建 chroma_db（只影响查询，不影响索引内容）
+- 与第 5 步的关系：本步只让"事实查询"更准，**替代不了 SQL**（见核心概念 6）
+- 与 V7.8 的关系：验证了"混合检索 + 精排"让 Top-k 检索在更大数据量下依然可用，
+  但仍受"原文进提示词"的物理限制
+
 ---
 
 ### V8+ 未来规划（详见 improvements.txt）
 
 | 步骤 | 内容 | 关键工具 |
 | --- | --- | --- |
-| 3 | BM25 混合检索 + 重排序 | langchain-retrievers / bge-reranker |
+| 3 | BM25 混合检索 + 重排序（✅ 已完成 V7.9） | 手写 RRFRetriever / RerankerRetriever（bge-reranker） |
 | 4 | 视频字幕 / 语音转写 | srt 解析 / faster-whisper |
-| 5 | assets/logo 素材规范 | 本地目录 → 对象存储 |
-| 6 | FastAPI 封装 + 前端 | FastAPI / 简单网页 |
-| 7 | 海报 / 文案生成 | LLM 文案 + 程序化叠加 logo |
+| 5 | Text-to-SQL + 路由器（问题分流） | SQLite 起步 → MySQL / RunnableBranch |
+| 6 | FastAPI 封装 + 前端（封装完整能力） | FastAPI / 简单网页 |
+| 7 | assets/logo 素材规范 | 本地目录 → 对象存储 |
+| 8 | 海报 / 文案生成 | LLM 文案 + 程序化叠加 logo |
+| 9 | 多轮记忆 + 跨轮状态（引用上轮结果） | ChatMessageHistory / 会话状态 |
+| 10 | Agent 工具化（多步任务自主编排） | query_sql / retrieve_vector / read_memory |
 
 ---
 
@@ -434,6 +502,69 @@ LOADER_MAP = {
 
 ---
 
+### 核心概念 5：引用"上一轮结果"的推理 ≠ 检索（多轮对话的边界）
+
+> 为什么第 2 轮问"基于刚才导出的第 3 条分析一下"不能走向量检索？
+
+**先认清信息来源**：RAG 检索只能从**知识库**（已入库的片段）里找答案；
+而"上一轮的导出结果"是一个**运行时中间产物**，只存在于会话里，不在知识库里。
+所以这类问题检索必然命中不了——它不是检索问题，是 **memory / 状态** 问题。
+
+**本项目实战推演**（延续第 5 步 Text-to-SQL 场景）：
+- 第 1 轮：问"所有客户的信息" → 路由器判断是"列举"类，走 SQL 链，全量导出
+  3 条客户记录（华信银行、优品超市、明德学院）
+- 第 2 轮：问"基于刚才导出的第 3 条分析一下" → 如果走**向量检索**，
+  Chroma 里只有原始知识库片段，没有"第 3 条导出记录"这个对象，
+  检索结果必然无关；正确做法是从**会话状态**里取出第 3 条再交给模型推理
+
+**三条技术路线（第 9、10 步）**：
+| 技术 | 作用 | 对应步骤 |
+| --- | --- | --- |
+| 会话记忆（session_id + ChatMessageHistory） | 记住"上轮问了什么、答了什么" | 第 9 步 |
+| 跨轮状态管理（SQL 结果暂存会话，路由优先查状态） | 用户引用上轮结果时直接从状态取 | 第 9 步 |
+| Agent 工具化（query_sql / retrieve_vector / read_memory） | 模型自主决定查库还是读状态 | 第 10 步 |
+
+**教学含义**：RAG 有两条边界——①**数据量边界**（列举类问题需要全量访问，
+见核心概念 4）；②**信息来源边界**（只能答知识库里有的，答不了"会话里才有的
+中间结果"）。后者靠记忆/状态补，路由器升级为三路：vector / sql / memory。
+
+---
+
+### 核心概念 6：换 BM25/reranker 也替代不了 SQL（检索 vs 查询）
+
+> 为什么第 3 步的 BM25 + bge-reranker 在 1 万个客户时，依然替代不了第 5 步的 SQL？
+> （接核心概念 4：那里说"列举类 ≠ Top-k"，这里进一步问"把 Top-k 换成更好的检索器行不行"）
+
+**先认清"检索"和"查询"是两种能力**：
+- **检索**（向量 / BM25 / reranker）＝按"相关度"排序，返回前 N 条**原文片段**——
+  本质是"挑最像的少数几条"，无论排序算法多好，返回的还是原文
+- **查询**（SQL）＝按条件**过滤、聚合、统计**，返回**压缩后的结果**——
+  本质是"集合运算"，结果体积远小于原始数据
+
+**为什么换检索器也不行（本项目 1 万客户实战推演，问"所有客户的行业有哪些？"）**：
+| 方案 | 结果 | 为什么不行 |
+| --- | --- | --- |
+| 向量 k=10000 | ❌ | 1 万行原文塞提示词 → token 超限 + 噪声爆炸 |
+| BM25 k=10000 | ❌ | token 一样超限；且"行业"关键词每行都有（V7.6 表头拼接），BM25 打分全相同，排序失效，退化成顺序截断 |
+| reranker 精排 1 万条 | ❌ | 交叉编码器逐条算分极慢；且它只做"排序取前 N"，**不做去重/聚合** |
+| SQL：`SELECT DISTINCT 行业 FROM 客户` | ✅ | 返回"金融、零售、教育"3 行，结果被压缩 |
+
+**核心差异一句话**：检索返回"原文"，1 万条原文塞不进提示词——这是**物理限制**；
+SQL 返回"计算结果"，体积被压缩——这才是万级数据可行的**本质**。
+
+**两者的正确分工（第 3 步 vs 第 5 步，不是平替是互补）**：
+- 第 3 步 BM25 + reranker：让**事实查询**（"华信银行是什么行业"）在万级库里依然又全又准
+  （广召回 Top 50 → 精排 Top 6），不因数据量变大而漏掉关键块；
+- 第 5 步 Text-to-SQL：让**列举/统计/聚合**（"所有客户的行业有哪些"）在万级数据下可行；
+- 路由器按问题类型分流：事实查询 → 检索链；列举/统计 → SQL 链。
+
+**教学含义**：数据量变大后，优化检索器（第 3 步）是"把事实查询做得更准"，
+但解决不了"全量访问"类问题——那是架构升级（数据入库 + SQL）的事。
+类比：检索是**图书管理员按相关度挑 10 本书**，SQL 是**会计对 1 万张发票做统计**；
+你要"全量字段"是会计的活，换哪个管理员（BM25 还是向量）都变不成会计。
+
+---
+
 ## 四、依赖包清单（当前 requirements.txt）
 
 | 包 | 作用 | 对应功能 | 备注 |
@@ -447,7 +578,9 @@ LOADER_MAP = {
 | `pypdf` | PDF 解析 | `PyPDFLoader` | V6 新增 |
 | `docx2txt` | Word 解析 | `Docx2txtLoader` | V6 新增 |
 | `openpyxl` | Excel 解析 | `load_xlsx`（自写函数） | V7.5 新增 |
-| `sentence-transformers` | 嵌入模型底层 | bge-small-zh 运行环境 | |
+| `rank-bm25` | BM25 关键词检索算法 | `BM25Retriever` 底层 | V7.9 新增 |
+| `jieba` | 中文分词 | BM25 中文预处理（preprocess_func） | V7.9 新增 |
+| `sentence-transformers` | 嵌入模型底层 | bge-small-zh 运行环境 + bge-reranker 交叉编码 | |
 | `python-dotenv` | 环境变量 | `load_dotenv()` 读 .env | |
 
 ---
@@ -485,6 +618,9 @@ pip install -r requirements.txt
 | 表头分离 | 问"客户行业"答"字段未显示" | 表格按行切，表头行与数据行分离 | 表头拼进数据行（字段名: 值） |
 | 列举答不全 | 问"所有客户行业"只答 1 个 | k=2 太小，同类记录没进候选 | k 调大（本项目 k=6） |
 | MMR 误伤 | 用 MMR 后同类行仍只回 1 条 | MMR 把结构相似的表格行当"重复"去重 | 表格场景用普通相似度检索 |
+| BM25 中文失效 | BM25 检索中文整句当一个词，命中全乱 | rank_bm25 默认按空格分词 | 传 jieba 分词器（preprocess_func） |
+| 参数名不兼容 | BM25Retriever 报 TypeError | langchain-community 版参数是 preprocess_func，新版才叫 tokenizer | 以本项目已装版本为准 |
+| 包装不上 | langchain-retrievers 无法安装 | 国内镜像未同步 / PyPI 无此包 | 手写 RRFRetriever / RerankerRetriever |
 | 验证脚本卡死 | 运行 _verify.py 报"连接方...没有正确答复" | HuggingFaceEmbeddings 初始化联网访问 HF 超时 | 验证索引用 chromadb 直接读，不加载嵌入模型 |
 | PowerShell | rmdir /s /q 报错找不到参数 | /s /q 是 cmd 语法 | 用 Remove-Item -Recurse -Force |
 | git push | SSL peer certificate 错误 | Windows 证书链问题 | `git config http.sslVerify false`（项目级） |
@@ -509,3 +645,4 @@ pip install -r requirements.txt
 | （已提交） | xlsx 表头拼接修复（字段名拼进数据行） | V7.6 |
 | （已提交） | 检索参数调优：k=2 → k=6（修复列举类问题答不全） | V7.7 |
 | （已提交） | 认知边界记录：列举类问题 ≠ Top-k 检索（纯文档） | V7.8 |
+| （待提交） | BM25 混合检索 + RRF 融合 + bge-reranker 精排（第三阶段） | V7.9 |

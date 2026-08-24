@@ -4,6 +4,11 @@ langchain-text-splitters>=0.3.0
 langchain-huggingface>=0.1.0
 langchain-chroma>=0.1.0
 langchain-community>=0.3.0
+rank-bm25>=0.2.2
+jieba>=0.42.1
+# 注：官方 EnsembleRetriever / CrossEncoderReranker 在独立包 langchain-retrievers 中，
+#     但该包在国内镜像（清华/阿里）未同步、PyPI 无法安装，本项目改为手写实现
+#     （见 rag.py 中的 RRFRetriever / RerankerRetriever，教学价值更高）
 pypdf>=5.0.0
 docx2txt>=0.8
 openpyxl>=3.0.0

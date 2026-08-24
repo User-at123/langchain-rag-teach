@@ -1,9 +1,11 @@
-"""LangChain RAG 教学示例：检索增强生成（第二阶段：多格式加载 + 按格式差异化切分）。
+"""LangChain RAG 教学示例：检索增强生成（第三阶段：混合检索 + 重排序）。
 
-流程：加载文档（txt/md/pdf/docx/csv/xlsx）→ 按格式切分 → 嵌入 → Chroma 检索 → 生成
+流程：加载文档（txt/md/pdf/docx/csv/xlsx）→ 按格式切分 → 嵌入 → 混合检索（BM25 关键词 + 向量语义）→ 重排序（bge-reranker）→ 生成
 """
 
 import os
+
+import jieba
 
 from dotenv import load_dotenv
 
@@ -20,6 +22,8 @@ if os.getenv("HF_ENDPOINT"):
 if os.getenv("USE_INSECURE_SSL") == "1":
     os.environ["HF_HUB_DISABLE_SSL_VERIFY"] = "1"
 
+from typing import Any, List
+
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import (
     CSVLoader,
@@ -27,14 +31,17 @@ from langchain_community.document_loaders import (
     PyPDFLoader,
     TextLoader,
 )
+from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.retrievers import BaseRetriever
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI
 from langchain_text_splitters import (
     MarkdownHeaderTextSplitter,
     RecursiveCharacterTextSplitter,
 )
+from pydantic import ConfigDict, Field, PrivateAttr
 
 # ========== 1. 加载文档（支持多格式） ==========
 # 规则：docs/ 目录里有文件 → 按扩展名路由到对应 Loader 加载全部；
@@ -214,14 +221,113 @@ else:
         persist_directory=CHROMA_DIR,
     )
 
-# ========== 4. 创建检索器 ==========
-# 根据问题找出最相关的片段：
-#   - k=6：返回最相关的 6 个片段。k 是"回答的视野"——k 太小（如 2），
-#     问"所有客户的行业有哪些"只召回 1 条案例行，模型只能答出 1 个客户；
-#     k 调大后同类记录都能进候选，模型才能汇总出完整列表
-#   - 曾经尝试 MMR（最大边际相关性）检索：它在"相关 + 多样"间平衡，但 3 条客户案例行
-#     结构相似会被当成"重复"而只留 1 条，反而丢信息；普通相似度检索在小知识库更直观有效
-retriever = vector_store.as_retriever(search_kwargs={"k": 6})
+# ========== 4. 创建检索器（第三阶段：混合检索 + 重排序） ==========
+# 思路：两路召回（BM25 关键词 + 向量语义）取并集 → 广召回 Top 50 →
+#       bge-reranker 精排 → 只留 top_n 条进提示词
+# 为什么不再用单一向量检索：向量找"意思相近"，对专有名词/精确词不敏感；
+#   BM25 按词频命中关键词，两者互补。数据量变大后（千级~万级片段），
+#   靠调大 k 会噪声爆炸（见 mindmap 核心概念 4/6），混合检索 + 精排才是"又全又准"的正解。
+#   k 的职责变化（V7.7 → V7.9）：k 从"回答视野"降级为"粗筛漏斗"，精排后才定最终视野。
+# 注：检索参数变化不需要重建 chroma_db（只影响查询，不影响索引内容）。
+
+# ===== 手写工具类：RRF 融合 + Reranker 精排 =====
+# 为什么手写：官方 EnsembleRetriever / CrossEncoderReranker 在独立包 langchain-retrievers 中，
+# 但该包国内镜像（清华/阿里）未同步、PyPI 无法安装；且手写实现（各约 20 行）能把
+# 这两个"黑盒"讲透，教学价值更高。依赖只需 rank_bm25 + jieba（均已安装）。
+
+
+class RRFRetriever(BaseRetriever):
+    """互惠排名融合（Reciprocal Rank Fusion）——手写版 EnsembleRetriever。
+
+    多路检索器各自给出 Top-k 排名，融合公式：score(d) = Σ 1/(k + rank_i(d))
+    - 只比"排名"不比"分数"：BM25 的得分和向量余弦相似度量纲不同，直接相加无意义；
+    - 排名越靠前贡献越大，两路都命中的片段自然排最前（"互补"的数学体现）。
+    """
+
+    retrievers: List[BaseRetriever] = Field(description="多路检索器（如 BM25 + 向量）")
+    rrf_k: int = Field(default=60, description="RRF 常数（经验值 60）")
+    top_n: int = Field(default=50, description="融合后保留的候选条数")
+
+    def _get_relevant_documents(self, query: str, *, run_manager: Any = None):
+        scores: dict = {}    # page_content -> 累计融合分
+        docs_map: dict = {}  # page_content -> Document（保留 metadata）
+        for retriever in self.retrievers:
+            for rank, doc in enumerate(retriever.invoke(query)):
+                key = doc.page_content
+                docs_map.setdefault(key, doc)
+                scores[key] = scores.get(key, 0.0) + 1.0 / (self.rrf_k + rank)
+        ranked = sorted(
+            docs_map.values(),
+            key=lambda d: scores[d.page_content],
+            reverse=True,
+        )
+        return ranked[: self.top_n]
+
+
+class RerankerRetriever(BaseRetriever):
+    """bge-reranker 精排检索器——手写版官方"重排序器 + 压缩检索器"组合。
+
+    流程：base_retriever 粗召回 Top 50 → 交叉编码器把"问题+文档"拼成一段算相关度 →
+          按分数重排，只留 top_n 条。
+    为什么用交叉编码器：双塔嵌入（向量检索）先各自编码再算相似度，快但精度有限；
+    交叉编码器同时看问题与文档全文，精度高但逐条计算慢，所以只对少量候选精排。
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    base_retriever: BaseRetriever = Field(description="粗召回检索器（混合检索）")
+    model_name: str = Field(
+        default="BAAI/bge-reranker-base",
+        description="交叉编码器模型名（首次运行自动下载）",
+    )
+    top_n: int = Field(
+        default=6,
+        description="精排后保留的条数（最终进提示词的视野，承接 V7.7 的 k=6 经验）",
+    )
+
+    _cross_encoder: Any = PrivateAttr(default=None)
+
+    def _get_cross_encoder(self):
+        """懒加载交叉编码器：首次调用才下载模型，避免 import 阶段联网卡住"""
+        if self._cross_encoder is None:
+            from sentence_transformers import CrossEncoder
+
+            self._cross_encoder = CrossEncoder(self.model_name)
+        return self._cross_encoder
+
+    def _get_relevant_documents(self, query: str, *, run_manager: Any = None):
+        candidates = self.base_retriever.invoke(query)     # 粗召回 Top 50
+        pairs = [(query, d.page_content) for d in candidates]
+        scores = self._get_cross_encoder().predict(pairs)  # 逐条相关度，越大越相关
+        ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+        return [d for d, _ in ranked[: self.top_n]]
+
+
+# 4.1 BM25 关键词检索（内存索引，每次运行由 chunks 现场重建，无需持久化）
+#     坑：rank_bm25 默认按空格分词，中文整句会被当成一个 token，BM25 直接失效；
+#         必须传入 jieba 分词器（中文场景的关键踩坑点）。
+#     参数名注意：本项目 langchain-community 版本用 preprocess_func（新版独立包才叫 tokenizer）
+bm25_retriever = BM25Retriever.from_texts(
+    [c.page_content for c in chunks],
+    k=50,
+    preprocess_func=lambda t: list(jieba.cut(t)),
+    metadatas=[c.metadata for c in chunks],  # 保留 source 等元数据，方便追溯
+)
+
+# 4.2 向量语义检索（现有 Chroma，召回放宽到 50，让 reranker 来精排）
+vector_retriever = vector_store.as_retriever(search_kwargs={"k": 50})
+
+# 4.3 融合两路召回（手写 RRF：只比排名不比分数，两路都命中的片段自然最靠前）
+ensemble_retriever = RRFRetriever(
+    retrievers=[bm25_retriever, vector_retriever],
+)
+
+# 4.4 重排序（bge-reranker 交叉编码器：候选逐条与问题算相关度，精排后只留 top_n 条）
+retriever = RerankerRetriever(
+    base_retriever=ensemble_retriever,
+    model_name=os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base"),
+    top_n=6,
+)
 
 # ========== 5. 模型 + 提示词 ==========
 # 把检索到的内容作为"参考资料"塞进提示词，让模型据此回答

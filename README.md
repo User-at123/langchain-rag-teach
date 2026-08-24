@@ -25,6 +25,7 @@ python rag.py     # RAG 问答（首次运行会下载嵌入模型并建索引�
 | `OPENAI_BASE_URL` | DeepSeek 接口地址，默认已填好 |
 | `LLM_MODEL` | 对话模型，默认 `deepseek-chat`（也可填 `deepseek-reasoner`） |
 | `EMBEDDING_MODEL` | 嵌入模型，默认 `BAAI/bge-small-zh-v1.5`（本地开源模型） |
+| `RERANKER_MODEL` | 可选，重排序模型，默认 `BAAI/bge-reranker-base`（首次运行自动下载） |
 | `CHROMA_DIR` | 向量索引存储目录，默认 `./chroma_db`（首次运行创建，之后直接加载） |
 | `HF_ENDPOINT` | 可选，HuggingFace 国内镜像（`https://hf-mirror.com`），加速/修复模型下载 |
 | `USE_INSECURE_SSL` | 可选，设为 `1` 可跳过 SSL 证书验证（仅教学用，修复证书报错） |
@@ -76,6 +77,14 @@ python rag.py
 >
 > **表格处理（2.6 步）**：`.xlsx` 的第 1 行视为表头，数据行入库为 `字段名: 值` 形式
 > （如 `客户行业: 金融 | 客户名称: 华信银行`），避免表头行与数据行分离导致"问字段名拿不到值"。
+>
+> **混合检索 + 重排序（第 3 步）**：检索从"单一向量 Top-k"升级为三环节流水线——
+> ① BM25 关键词检索（jieba 分词，命中专有名词/精确词）
+> ② 向量语义检索（命中意思相近的表述）
+> ③ RRF 互惠排名融合两路结果（只比排名不比分数），再经 bge-reranker 精排，
+> 只留 Top 6 进提示词。k 从"回答视野"（V7.7 的 k=6）变为"粗筛漏斗"。
+> 手写实现 RRFRetriever / RerankerRetriever（官方 EnsembleRetriever 所在的
+> langchain-retrievers 包装不上，见 mindmap 踩坑表）。
 
 ## 代码结构
 
@@ -107,7 +116,7 @@ RAG = 检索（Retrieval）+ 增强（Augmented）+ 生成（Generation），
 | 切分 | `split_documents_by_format()` 按格式路由 | 长文本切小块；.md 按标题切、.csv/.xlsx 按行切、其余通用切分 |
 | 嵌入 | `HuggingFaceEmbeddings` | 用本地开源模型把文本转成向量 |
 | 存储 | `Chroma` | 向量库，索引落盘到 `./chroma_db`，重启后直接加载无需重建 |
-| 检索 | `vector_store.as_retriever(k=6)` | 按相似度找最相关片段；k 决定"回答视野"，列举类问题需要大 k（如"所有客户的行业"）。局限：万级数据靠调 k 无解，需结构化 RAG / Text-to-SQL（见 mindmap 核心概念 4） |
+| 检索 | `retriever`（第三阶段：BM25 + 向量 → RRF 融合 → bge-reranker 精排 Top 6） | 两路召回取长补短：BM25 命中关键词、向量命中语义；RRF 只比排名不比分数；精排后 6 条进提示词。局限：只让"事实查询"更准，万级全量列举/统计类问题仍靠 SQL（见 mindmap 核心概念 6） |
 | 增强 | 把 `{context}` 塞进提示词 | 让模型"带着资料"作答，并标注来源 |
 
 **建议体验**：先用 `main.py` 问"星辰科技是哪年成立的"（模型不知道，会编造），
