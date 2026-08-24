@@ -59,9 +59,100 @@ def load_text(path, encoding):
     return TextLoader(path, encoding=encoding).load()
 
 
+# ===== PDF 加载（含扫描件自动 OCR）=====
+# 判定阈值：一页提取出的文字少于该数量 → 视为扫描页（无文字层，需 OCR）
+OCR_MIN_TEXT_LEN = 20
+# OCR 结果缓存目录：识别出的文本落盘，下次构建索引直接读缓存，不再重跑 OCR
+# 注意：必须在 docs/ 之外（如项目根），否则会被 os.walk 遍历当成文档重复加载
+OCR_CACHE_DIR = os.getenv("OCR_CACHE_DIR", "./ocr_cache")
+
+
+def _ocr_cache_path(path):
+    """由 PDF 路径推导缓存文件路径：ocr_cache/<PDF 文件名去扩展名>.txt。"""
+    os.makedirs(OCR_CACHE_DIR, exist_ok=True)
+    return os.path.join(OCR_CACHE_DIR, os.path.splitext(os.path.basename(path))[0] + ".txt")
+
+
+def _write_ocr_cache(cache_path, page_texts):
+    """把 {页索引: 文本} 写入缓存文件（分隔行格式，正文可含换行）。
+    读写都指定 newline="\\n"，避免 Windows 下 \\n 被写成 \\r\\n 导致解析错位。"""
+    with open(cache_path, "w", encoding="utf-8", newline="\n") as f:
+        for idx in sorted(page_texts):
+            f.write(f"<<<PAGE:{idx}>>>\n{page_texts[idx]}\n")
+
+
+def _read_ocr_cache(cache_path):
+    """读缓存文件，返回 {页索引: 文本}。"""
+    with open(cache_path, encoding="utf-8", newline="\n") as f:
+        content = f.read()
+    cached = {}
+    for part in content.split("<<<PAGE:")[1:]:
+        idx_str, _, text = part.partition(">>>\n")
+        cached[int(idx_str)] = text.rstrip("\n")
+    return cached
+
+
 def load_pdf(path):
-    """加载 .pdf：PyPDFLoader 按页切出多个 Document（二进制解析，无编码问题）。"""
-    return PyPDFLoader(path).load()
+    """加载 .pdf：文字版直接提取；扫描页自动走 OCR（离线中文识别）。
+
+    教学点：PDF 分两种——"文字版"（可复制，PyPDFLoader 直接读）和
+    "扫描版"（每页是一张图，提取出来是空字符串）。
+    这里逐页判定：文字层够的页直接用，不够的页用 PyMuPDF 渲染成图片
+    + RapidOCR（包内自带模型，完全离线）识别，识别结果补回原 Document。
+    """
+    docs = PyPDFLoader(path).load()
+    # 第 1 步：找出"扫描页"（提取文字过少）
+    ocr_idx = [i for i, d in enumerate(docs)
+               if len(d.page_content.strip()) < OCR_MIN_TEXT_LEN]
+    if not ocr_idx:
+        print(f"  {path}: 文字版 PDF，{len(docs)} 页直接提取（无需 OCR）")
+        return docs
+
+    # —— OCR 结果缓存：识别过的页落盘，下次直接读，不再重跑 ——
+    cache_path = _ocr_cache_path(path)
+    if os.path.exists(cache_path) and os.path.getmtime(cache_path) >= os.path.getmtime(path):
+        cached = _read_ocr_cache(cache_path)
+        hit = 0
+        for i in ocr_idx:
+            if i in cached:
+                docs[i] = Document(
+                    page_content=cached[i],
+                    metadata={**docs[i].metadata, "ocr": True},
+                )
+                hit += 1
+        print(f"  {path}: 命中 OCR 缓存（{hit}/{len(ocr_idx)} 页），跳过识别，直接读文本")
+        return docs
+
+    # 第 2 步：扫描页走 OCR（模型懒加载：只有遇到扫描件才 import/初始化，
+    #         普通文字版 PDF 不受影响，启动不被拖慢）
+    print(f"  {path}: {len(ocr_idx)}/{len(docs)} 页是扫描件，开始 OCR（较慢，请耐心）...")
+    import pymupdf as fitz  # PyMuPDF：渲染 PDF 页为位图（新版包名 pymupdf，兼容旧名 fitz）
+    import numpy as np
+    from PIL import Image
+    from rapidocr_onnxruntime import RapidOCR  # 离线中文 OCR，模型内置于包内
+    from tqdm import tqdm  # 进度条：当前页/总页数、速度、预计剩余时间一目了然
+
+    ocr = RapidOCR()
+    pdf = fitz.open(path)
+    recognized = {}  # 页索引 -> OCR 文本（跑完一次性写入缓存）
+    for i in tqdm(ocr_idx, desc=f"OCR {os.path.basename(path)}", unit="页"):
+        pix = pdf[i].get_pixmap(dpi=200)      # 页面渲染成位图（dpi 越高越清晰也越慢）
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        result, _ = ocr(np.array(img))        # result: [[四角坐标, 文字, 置信度], ...]
+        if not result:                        # 纯图片页 / 识别不出 → 记空文本（也缓存，避免下次重跑）
+            recognized[i] = ""
+            continue
+        result.sort(key=lambda r: r[0][0][1])  # 按行从上到下排序，保持阅读顺序
+        recognized[i] = "\n".join(r[1] for r in result)
+        docs[i] = Document(
+            page_content=recognized[i],
+            metadata={**docs[i].metadata, "ocr": True},  # 标记 OCR 来源，方便溯源
+        )
+    pdf.close()
+    _write_ocr_cache(cache_path, recognized)
+    print(f"  {path}: OCR 完成，共识别 {len(recognized)} 页；结果已缓存到 {cache_path}")
+    print(f"          下次构建索引直接读缓存，这本 PDF 不再重跑 OCR")
+    return docs
 
 
 def load_docx(path):
@@ -230,6 +321,15 @@ else:
 #   k 的职责变化（V7.7 → V7.9）：k 从"回答视野"降级为"粗筛漏斗"，精排后才定最终视野。
 # 注：检索参数变化不需要重建 chroma_db（只影响查询，不影响索引内容）。
 
+# ===== 3.5 模型（提前定义） =====
+# 提前到检索器之前：V8.2 的 MultiQueryRetriever 需要 LLM 把问题拆成多路子查询
+#（见 4.5），主问答链（第 5 节）复用同一个 llm 实例。
+llm = ChatOpenAI(
+    base_url=os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1"),
+    model=os.getenv("LLM_MODEL", "deepseek-chat"),
+    temperature=0.3,
+)
+
 # ===== 手写工具类：RRF 融合 + Reranker 精排 =====
 # 为什么手写：官方 EnsembleRetriever / CrossEncoderReranker 在独立包 langchain-retrievers 中，
 # 但该包国内镜像（清华/阿里）未同步、PyPI 无法安装；且手写实现（各约 20 行）能把
@@ -303,6 +403,134 @@ class RerankerRetriever(BaseRetriever):
         return [d for d, _ in ranked[: self.top_n]]
 
 
+class MultiQueryRetriever(BaseRetriever):
+    """多路子查询检索器——手写版官方 MultiQueryRetriever（V8.2 新增）。
+
+    解决的问题：枚举/聚合类问题（"有几个/都是谁"）单路检索会漏"全集"。
+    原因：一个问法只能匹配一种"说法"，而同一事实在原文有多种表达
+    （田雨=妻子，秀芹=婆娘/娶媳妇/新婚妻子）。问题里只带"妻子"一词，
+    BM25/向量就只命中田雨（书里明确写"你的妻子田雨"），秀芹全漏。
+
+    流程（三步）：
+      1. LLM 一次调用把问题拆成多路子查询（覆盖不同说法/人名/角度）
+      2. 每路子查询各自粗召回（RRF top50），全部候选【合并成一个 batch】
+         一次性喂给 reranker 精排——每对用自己的子查询打分
+      3. 每路取精排前 per_query_top_n → 按 rank 融合分排序（不同路的分数
+         量纲不可比，只比排名）→ 合并去重 → 最终 top_n 进 LLM 视野
+
+    并行要点（教学点，见 mindmap 核心概念 10）：
+      - 拆分子查询是一次 LLM 调用，没有并行空间（多线程调用只会翻倍成本）
+      - 提速靠 reranker 的 batch 推理：全部候选对合并成一个大 batch 一次
+        predict，模型只加载一次、单次推理，比逐路 predict 快得多；
+        也比多线程更有效（Python GIL 下 CPU 推理多线程会串行化）
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    base_retriever: BaseRetriever = Field(description="粗召回检索器（RRF 混合检索）")
+    llm: Any = Field(description="生成子查询的 LLM（一次调用生成多路）")
+    sub_query_count: int = Field(default=5, description="拆成几路子查询")
+    per_query_top_n: int = Field(default=4, description="每路子查询精排后保留条数（给弱相关但关键的信息留空间）")
+    recall_top_n: int = Field(
+        default=20,
+        description="每路子查询粗召回条数。精排只取前 per_query_top_n 条进最终视野，"
+        "召回 50 条纯属浪费——reranker 是本地 CPU 交叉编码器，50 条/路 × 5 路 = 250 对"
+        "要算 ~25 秒（实测），砍到 20 条/路 = 100 对 ≈ 11 秒，质量不变（V8.2 性能优化）",
+    )
+    top_n: int = Field(default=6, description="最终进 LLM 视野的条数")
+    model_name: str = Field(
+        default="BAAI/bge-reranker-base",
+        description="交叉编码器模型名（与 RerankerRetriever 同款）",
+    )
+
+    _cross_encoder: Any = PrivateAttr(default=None)
+
+    def _get_cross_encoder(self):
+        """懒加载交叉编码器：首次调用才下载模型（与 RerankerRetriever 同款）"""
+        if self._cross_encoder is None:
+            from sentence_transformers import CrossEncoder
+
+            self._cross_encoder = CrossEncoder(self.model_name)
+        return self._cross_encoder
+
+    def _generate_sub_queries(self, query):
+        """一次 LLM 调用生成子查询列表（要求 JSON 数组，容错解析）。
+
+        解析三级降级：json.loads → 正则抓 [...] → 退化返回原问题本身，
+        保证 LLM 输出不规范时检索链路不崩。
+        """
+        import json
+        import re
+
+        prompt = (
+            f"你是检索辅助器。请把用户问题改写成 {self.sub_query_count} 个不同的子查询，"
+            "用于分别检索知识库。\n"
+            "要求：\n"
+            "1. 如果问题在问一个\"集合\"（如\"有几个/都有谁/分别是\"），请为每个可能的成员"
+            "单独生成一个子查询，并直接带上该成员的名字或专有名词"
+            "（如\"李云龙第一任妻子 杨秀芹\"、\"李云龙第二任妻子 田雨\"）；\n"
+            "2. 每个子查询只聚焦一个对象/一个说法，不要在一个子查询里混多个名字；\n"
+            "3. 可补充\"关系式\"问法（如\"杨秀芹和李云龙是什么关系\"），绕开原问题里的关键词；\n"
+            "4. 每个子查询包含足够上下文词，能独立完成检索；\n"
+            "5. 只返回 JSON 数组字符串（如 [\"子查询1\", \"子查询2\", ...]），不要任何其他文字。\n\n"
+            f"用户问题：{query}"
+        )
+        resp = self.llm.invoke(prompt)
+        text = getattr(resp, "content", str(resp)).strip()
+
+        def _try_parse(t):
+            arr = json.loads(t)
+            if isinstance(arr, list):
+                return [s.strip() for s in arr if isinstance(s, str) and s.strip()]
+            return None
+
+        try:
+            subs = _try_parse(text)
+            if subs:
+                return subs[: self.sub_query_count]
+        except Exception:
+            pass
+        m = re.search(r"\[.*\]", text, re.S)
+        if m:
+            try:
+                subs = _try_parse(m.group(0))
+                if subs:
+                    return subs[: self.sub_query_count]
+            except Exception:
+                pass
+        return [query]  # 解析失败：退化用原问题本身
+
+    def _get_relevant_documents(self, query: str, *, run_manager: Any = None):
+        sub_queries = self._generate_sub_queries(query)
+        # 第 2 步：每路粗召回，收集 (子查询, Document) 对
+        collected = []
+        for sq in sub_queries:
+            for doc in self.base_retriever.invoke(sq)[: self.recall_top_n]:
+                collected.append((sq, doc))
+        # 关键提速点：全部候选对合并成一个 batch 一次 predict（批量并行），
+        # 每对用自己的子查询打分——比逐路 predict 少加载模型、单次推理更快
+        pairs = [(sq, d.page_content) for sq, d in collected]
+        scores = self._get_cross_encoder().predict(pairs, batch_size=64)
+        # 第 3 步：按子查询分组，每路取精排前 per_query_top_n，rank 融合排序
+        by_route = {}
+        for (sq, doc), s in zip(collected, scores):
+            by_route.setdefault(sq, []).append((doc, s))
+        fusion = {}  # page_content -> [Document, 融合分]
+        for sq, items in by_route.items():
+            for rank, (doc, s) in enumerate(
+                sorted(items, key=lambda x: x[1], reverse=True)
+            ):
+                if rank >= self.per_query_top_n:
+                    break  # 每路只保留精排前 per_query_top_n 条
+                key = doc.page_content
+                if key not in fusion:
+                    fusion[key] = [doc, 0.0]
+                # 只比排名不比分数：不同子查询打出的分数量纲不可比（实验已验证）
+                fusion[key][1] += 1.0 / (60 + rank)
+        ranked = sorted(fusion.values(), key=lambda x: x[1], reverse=True)
+        return [d for d, _ in ranked[: self.top_n]]
+
+
 # 4.1 BM25 关键词检索（内存索引，每次运行由 chunks 现场重建，无需持久化）
 #     坑：rank_bm25 默认按空格分词，中文整句会被当成一个 token，BM25 直接失效；
 #         必须传入 jieba 分词器（中文场景的关键踩坑点）。
@@ -323,20 +551,29 @@ ensemble_retriever = RRFRetriever(
 )
 
 # 4.4 重排序（bge-reranker 交叉编码器：候选逐条与问题算相关度，精排后只留 top_n 条）
-retriever = RerankerRetriever(
+reranker_retriever = RerankerRetriever(
     base_retriever=ensemble_retriever,
     model_name=os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base"),
     top_n=6,
 )
 
-# ========== 5. 模型 + 提示词 ==========
-# 把检索到的内容作为"参考资料"塞进提示词，让模型据此回答
-llm = ChatOpenAI(
-    base_url=os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1"),
-    model=os.getenv("LLM_MODEL", "deepseek-chat"),
-    temperature=0.3,
+# 4.5 MultiQuery 多路检索（V8.2 新增，手写版）：
+#     LLM 拆分子查询覆盖"不同说法" → 每路独立召回精排 → rank 融合合并。
+#     解决"枚举/聚合类问题"（几个/都有谁）单路检索漏全集——典型案例如
+#     "李云龙妻子有几个"：书里秀芹从不用"妻子"称呼，单路只命中田雨。
+#     RerankerRetriever 保留为单路精排组件（reranker_retriever），
+#     最外层 retriever 换 MultiQuery，管道 `| retriever |` 一行不用改。
+retriever = MultiQueryRetriever(
+    base_retriever=ensemble_retriever,
+    llm=llm,
+    sub_query_count=5,
+    per_query_top_n=3,
+    top_n=6,
 )
 
+# ========== 5. 提示词 ==========
+# 把检索到的内容作为"参考资料"塞进提示词，让模型据此回答
+#（llm 已在 3.5 节定义，MultiQuery 拆分子查询与主问答链共用同一个实例）
 prompt = ChatPromptTemplate.from_messages([
     ("system",
      "你是一个助手。请优先根据【参考资料】回答问题；"

@@ -27,6 +27,7 @@ python rag.py     # RAG 问答（首次运行会下载嵌入模型并建索引�
 | `EMBEDDING_MODEL` | 嵌入模型，默认 `BAAI/bge-small-zh-v1.5`（本地开源模型） |
 | `RERANKER_MODEL` | 可选，重排序模型，默认 `BAAI/bge-reranker-base`（首次运行自动下载） |
 | `CHROMA_DIR` | 向量索引存储目录，默认 `./chroma_db`（首次运行创建，之后直接加载） |
+| `OCR_CACHE_DIR` | OCR 结果缓存目录，默认 `./ocr_cache`（扫描 PDF 识别文本落盘，避免重复 OCR） |
 | `HF_ENDPOINT` | 可选，HuggingFace 国内镜像（`https://hf-mirror.com`），加速/修复模型下载 |
 | `USE_INSECURE_SSL` | 可选，设为 `1` 可跳过 SSL 证书验证（仅教学用，修复证书报错） |
 
@@ -50,12 +51,25 @@ Windows/公司代理环境的常见问题，二选一解决：
 **3. 修改了 docs/ 里的知识库文件，但 rag.py 回答还是旧内容**
 
 Chroma 索引是持久化的，不会自动感知源文件变化。更新知识库后，
-删掉 `chroma_db` 目录再运行即可重建索引：
+删掉 `chroma_db` 目录再运行即可重建索引（当前为全量重建模式；
+"增量更新"已规划为方案 B——记录文件指纹，只处理新增/变更的文件）：
 ```bash
-rmdir /s /q chroma_db    # Windows
+rmdir /s /q chroma_db    # Windows（PowerShell 用 Remove-Item -Recurse -Force chroma_db）
 # 或 rm -rf chroma_db    # Mac/Linux
 python rag.py
 ```
+
+**4. 放了 PDF 进去，但检索 PDF 内容为空**
+
+大概率是**扫描版 PDF**（每页是图片、没有文字层），`PyPDFLoader` 提取出来是空文本，
+程序不报错但检索结果为空。V8.0 起 `rag.py` 会自动检测并走 OCR（离线中文识别）：
+- 文字层够的页直接用；扫描页自动 OCR（首次碰到会加载 OCR 模型，稍慢）
+- OCR 全程有进度条（tqdm）：实时显示当前页/总页数、每页耗时、预计剩余时间，
+  等多久都看得见进度，不用猜"是不是卡住了"
+- 识别结果会缓存到 `ocr_cache/`（自动创建，无需手动管），下次构建索引直接读缓存，
+  不再重跑 OCR
+- 446 页全扫描预计 10~16 分钟（约 1.5~2 秒/页，CPU），属正常（OCR 固有成本，一次性）
+- 改完记得删 `chroma_db` 重建索引
 
 ## 知识库支持格式（docs/ 目录）
 
@@ -63,7 +77,7 @@ python rag.py
 | --- | --- |
 | `.txt` | 直接放入即可 |
 | `.md` | 直接放入即可；按标题层级切分（章节不拆散） |
-| `.pdf` | 直接放入即可 |
+| `.pdf` | 直接放入即可。文字版直接提取；扫描版（每页是图片）自动走 OCR 识别（V8.0：PyMuPDF 渲染 + RapidOCR 离线识别） |
 | `.docx` | Word 文档，直接放入即可 |
 | `.csv` | 直接放入即可；按行切分，一行一条记录 |
 | `.xlsx` | Excel，直接放入即可；按行切分，表头字段名会拼进每一行数据（2.6 步起） |
@@ -85,6 +99,13 @@ python rag.py
 > 只留 Top 6 进提示词。k 从"回答视野"（V7.7 的 k=6）变为"粗筛漏斗"。
 > 手写实现 RRFRetriever / RerankerRetriever（官方 EnsembleRetriever 所在的
 > langchain-retrievers 包装不上，见 mindmap 踩坑表）。
+>
+> **MultiQuery 多路检索（V8.2）**：问"李云龙妻子有几个"单路检索漏掉第一任妻子秀芹——
+> 书里从不用"妻子"称呼她（婆娘/娶媳妇/新婚妻子），一个问法只匹配一种"说法"。
+> 解法：LLM 把问题拆成多个子查询（"李云龙第一任妻子 杨秀芹"等），每路子查询独立
+> 召回 + 精排（每路用【自己的子查询】打分），rank 融合合并去重。手写 MultiQueryRetriever
+>（复用已有 CrossEncoder/ChatOpenAI，零新增依赖）。代价：每次问答多一次 LLM 调用
+>（拆分子查询，约 1~2 秒）——换"枚举/集合类问题不漏全集"。
 
 ## 代码结构
 
@@ -112,11 +133,11 @@ RAG = 检索（Retrieval）+ 增强（Augmented）+ 生成（Generation），
 
 | 环节 | 对应代码 | 作用 |
 | --- | --- | --- |
-| 加载文档 | `load_documents()`：`os.walk` 遍历 + `LOADER_MAP` 路由 | 扫描 docs/，按扩展名路由到对应加载函数（txt/md/pdf/docx/csv/xlsx） |
+| 加载文档 | `load_documents()`：`os.walk` 遍历 + `LOADER_MAP` 路由 | 扫描 docs/，按扩展名路由到对应加载函数（txt/md/pdf/docx/csv/xlsx）；PDF 逐页判定：扫描页自动 OCR（V8.0，带进度条 + 结果缓存到 ocr_cache/） |
 | 切分 | `split_documents_by_format()` 按格式路由 | 长文本切小块；.md 按标题切、.csv/.xlsx 按行切、其余通用切分 |
 | 嵌入 | `HuggingFaceEmbeddings` | 用本地开源模型把文本转成向量 |
 | 存储 | `Chroma` | 向量库，索引落盘到 `./chroma_db`，重启后直接加载无需重建 |
-| 检索 | `retriever`（第三阶段：BM25 + 向量 → RRF 融合 → bge-reranker 精排 Top 6） | 两路召回取长补短：BM25 命中关键词、向量命中语义；RRF 只比排名不比分数；精排后 6 条进提示词。局限：只让"事实查询"更准，万级全量列举/统计类问题仍靠 SQL（见 mindmap 核心概念 6） |
+| 检索 | `retriever`（V8.2 MultiQuery 多路检索：LLM 拆子查询 → 每路 BM25+向量 RRF 召回 → bge-reranker 精排 → rank 融合合并） | 解决"枚举/集合类问题"（有几个/都有谁）单路检索漏全集：一个问法只匹配一种"说法"，多路拆解覆盖不同说法后合并（实例：李云龙两任妻子 秀芹+田雨 都能召回）。每路内部仍是 BM25 关键词 + 向量语义 + RRF 融合 + reranker 精排。局限：万级全量列举/统计类问题仍靠 SQL（见 mindmap 核心概念 6） |
 | 增强 | 把 `{context}` 塞进提示词 | 让模型"带着资料"作答，并标注来源 |
 
 **建议体验**：先用 `main.py` 问"星辰科技是哪年成立的"（模型不知道，会编造），

@@ -9,3 +9,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# 大文件：亮剑扫描件原文 PDF（786MB，超 GitHub 100MB 限制，不入库）
+docs/*.pdf
+
+# OCR 结果缓存（运行时可自动重建，不提交）
+ocr_cache/
