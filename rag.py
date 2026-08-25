@@ -3,6 +3,7 @@
 流程：加载文档（txt/md/pdf/docx/csv/xlsx）→ 按格式切分 → 嵌入 → 混合检索（BM25 关键词 + 向量语义）→ 重排序（bge-reranker）→ 生成
 """
 
+import json
 import os
 
 import jieba
@@ -219,31 +220,37 @@ LOADER_MAP = {
 }
 
 
+def load_single_file(path):
+    """加载单个文件，返回 Document 列表（按扩展名路由到对应加载函数）。
+
+    从 load_documents 的循环体抽出（V8.1 增量索引）：
+    增量索引的最小处理单元是"一个文件"——新增/变更哪个文件就只加载哪个，
+    这个函数就是那一步的入口。
+    """
+    ext = os.path.splitext(path)[1].lower()  # 取出扩展名，如 ".pdf"
+    entry = LOADER_MAP.get(ext)
+    if entry is None:
+        print(f"跳过不支持的文件类型: {os.path.basename(path)}")
+        return []
+    load_fn, load_kwargs = entry  # 拆出加载函数和它的参数
+    # 每个文件加载出一个或多个 Document（自带 metadata={"source": 路径}）
+    return load_fn(path, **load_kwargs)
+
+
 def load_documents():
     """加载知识库文档，返回 Document 列表（每个带 page_content 和 metadata）。"""
     if os.path.isdir(DOCS_DIR) and any(os.listdir(DOCS_DIR)):
         docs = []
-        # 递归遍历 docs/ 下所有文件，按扩展名挑选对应加载函数逐个加载
+        # 递归遍历 docs/ 下所有文件，逐个加载（复用一个文件的加载逻辑）
         for root, _, files in os.walk(DOCS_DIR):
             for name in files:
-                ext = os.path.splitext(name)[1].lower()  # 取出扩展名，如 ".pdf"
-                entry = LOADER_MAP.get(ext)
-                if entry is None:
-                    print(f"跳过不支持的文件类型: {name}")
-                    continue
-                load_fn, load_kwargs = entry  # 拆出加载函数和它的参数
-                path = os.path.join(root, name)
-                # 每个文件加载出一个或多个 Document（自带 metadata={"source": 路径}）
-                docs.extend(load_fn(path, **load_kwargs))
+                docs.extend(load_single_file(os.path.join(root, name)))
         return docs
     else:
         # 回退路径：兼容旧版单文件教学
         with open("knowledge_base.txt", encoding="utf-8") as f:
             return [Document(page_content=f.read(), metadata={"source": "knowledge_base.txt"})]
 
-
-documents = load_documents()
-print(f"加载了 {len(documents)} 个文档")
 
 # ========== 2. 切分（Chunking）：按格式选择切分器 ==========
 # 2.5 步升级：不同格式的"语义单元"不同，切分策略也要不同：
@@ -284,10 +291,7 @@ def split_documents_by_format(documents):
     return chunks
 
 
-chunks = split_documents_by_format(documents)
-print(f"切分成 {len(chunks)} 个片段")
-
-# ========== 3. 嵌入 + 存储（Chroma 持久化） ==========
+# ========== 3. 嵌入 + 存储（Chroma 持久化 + 增量索引 V8.1） ==========
 # 把每个片段转成向量，存入 Chroma 向量库，索引会保存到磁盘（./chroma_db 目录）
 # 注意：DeepSeek 没有 Embedding API，所以用本地开源模型（首次运行会自动下载，约 100MB）
 embeddings = HuggingFaceEmbeddings(
@@ -296,21 +300,104 @@ embeddings = HuggingFaceEmbeddings(
 
 CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma_db")
 
-# 第二次及以后运行：索引已在磁盘上，直接加载，跳过重新嵌入（几秒搞定）
-if os.path.exists(CHROMA_DIR):
-    print("检测到已有向量索引，直接加载（无需重新嵌入）")
-    vector_store = Chroma(
-        embedding_function=embeddings,
-        persist_directory=CHROMA_DIR,
-    )
-# 第一次运行：创建索引并保存到磁盘
-else:
-    print("首次运行：创建向量索引并保存到磁盘 ...")
+# ===== 增量索引（V8.1）：文件指纹状态管理 =====
+# 为什么需要：之前是"chroma_db 存在直接加载 / 不存在全量重建"，中间没有
+# "哪些文件是新的"判断——往 docs/ 加新文件必须删库重建、所有文件重新嵌入，
+# 扫描 PDF 每次全量重 OCR（最贵一环反复支付）。
+# 现在用 .index_state.json 记录每个文件的指纹（mtime + size），启动时三向比对：
+#   新增 → 只嵌入新文件；变更 → 只重建该文件；删除 → 只删该文件；未变 → 跳过。
+# 指纹用 mtime+size 而非 md5：快（446 页 PDF 算 md5 有成本），教学够用；
+# 代价是"内容变了但 mtime/size 恰好没变"会漏检（生产环境可换 md5）。
+INDEX_STATE_FILE = os.getenv("INDEX_STATE_FILE", "./.index_state.json")
+
+
+def file_fingerprint(path):
+    """文件指纹：修改时间 + 大小（快，教学够用）。"""
+    st = os.stat(path)
+    return f"{st.st_mtime:.3f}-{st.st_size}"
+
+
+def scan_docs_files():
+    """扫描 docs/ 下所有支持的文件，返回 {路径: 指纹}（LOADER_MAP 之外的类型不参与）。"""
+    scanned = {}
+    if os.path.isdir(DOCS_DIR):
+        for root, _, files in os.walk(DOCS_DIR):
+            for name in files:
+                path = os.path.join(root, name)
+                if os.path.splitext(name)[1].lower() in LOADER_MAP:
+                    scanned[path] = file_fingerprint(path)
+    return scanned
+
+
+def load_index_state():
+    """读 .index_state.json，返回 {路径: 指纹}；文件不存在/解析失败返回 {}。"""
+    if os.path.exists(INDEX_STATE_FILE):
+        try:
+            with open(INDEX_STATE_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"  警告：状态文件解析失败（{e}），按无状态处理（全量校准）")
+    return {}
+
+
+def save_index_state(state):
+    """把 {路径: 指纹} 写回 .index_state.json（作为下次增量的基线）。"""
+    with open(INDEX_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# ===== 三向分支：首次全量 / 旧索引校准 / 增量比对 =====
+scan = scan_docs_files()
+
+if not os.path.exists(CHROMA_DIR):
+    # 分支 1：首次运行——全量加载 + 切分 + 嵌入
+    print("首次运行：加载全部文档 ...")
+    documents = load_documents()
+    print(f"加载了 {len(documents)} 个文档")
+    chunks = split_documents_by_format(documents)
+    print(f"切分成 {len(chunks)} 个片段")
+    print("创建向量索引并保存到磁盘 ...")
     vector_store = Chroma.from_documents(
         chunks,
         embedding=embeddings,
         persist_directory=CHROMA_DIR,
     )
+    save_index_state(scan)  # 全部文件记为"已入库"
+    print(f"  已记录 {len(scan)} 个文件的指纹（{INDEX_STATE_FILE}），下次启动开始走增量")
+else:
+    # 索引已存在：直接加载，不重新嵌入
+    vector_store = Chroma(
+        embedding_function=embeddings,
+        persist_directory=CHROMA_DIR,
+    )
+    state = load_index_state()
+    if not state:
+        # 分支 2：旧索引升级（有索引但无状态文件）——全量校准：只记指纹，不重新嵌入
+        # 教学假设：旧索引内容与磁盘一致（删库重建时代的产物）
+        print("检测到已有向量索引但无指纹状态（旧索引）→ 全量校准：记录指纹，不重新嵌入")
+        save_index_state(scan)
+        print(f"  已记录 {len(scan)} 个文件的指纹，下次启动开始走增量")
+    else:
+        # 分支 3：增量比对——只处理有变化的文件，其余零成本跳过
+        added = [p for p in scan if p not in state]
+        changed = [p for p in scan if p in state and scan[p] != state[p]]
+        removed = [p for p in state if p not in scan]
+        untouched = [p for p in scan if p in state and scan[p] == state[p]]
+        print(f"增量比对：新增 {len(added)} 变更 {len(changed)} 删除 {len(removed)} 跳过 {len(untouched)}")
+        for p in removed:
+            print(f"  [删除] {p}")
+            vector_store.delete(where={"source": p})
+        for p in added + changed:
+            action = "新增" if p in added else "变更"
+            print(f"  [{action}] {p}（单文件处理，其余跳过）")
+            docs = load_single_file(p)
+            new_chunks = split_documents_by_format(docs)
+            if p in changed:
+                # 变更：先按 source 删掉旧片段，再入库新的（避免残留重复）
+                vector_store.delete(where={"source": p})
+            vector_store.add_documents(new_chunks)  # 只嵌入这 1 个文件的片段
+        save_index_state(scan)  # 更新基线
+        print("  指纹基线已更新")
 
 # ========== 4. 创建检索器（第三阶段：混合检索 + 重排序） ==========
 # 思路：两路召回（BM25 关键词 + 向量语义）取并集 → 广召回 Top 50 →
@@ -503,13 +590,24 @@ class MultiQueryRetriever(BaseRetriever):
     def _get_relevant_documents(self, query: str, *, run_manager: Any = None):
         sub_queries = self._generate_sub_queries(query)
         # 第 2 步：每路粗召回，收集 (子查询, Document) 对
+        # V8.3 跨路去重：5 路子查询是同一问题的不同问法，命中的语料高度重叠——
+        # 实测 100 对候选按 page_content 去重后只剩 53 个唯一片段（重复率 47%），
+        # reranker 对相同内容算了不止一遍。同一片段只保留第一次出现，打分对数直接减半。
         collected = []
+        seen = set()  # 跨路去重：已见过的 page_content 不再重复打分
+        raw_count = 0
         for sq in sub_queries:
             for doc in self.base_retriever.invoke(sq)[: self.recall_top_n]:
+                raw_count += 1
+                if doc.page_content in seen:
+                    continue  # 被其他子查询召回过 → 跳过（同一片段取一次就够）
+                seen.add(doc.page_content)
                 collected.append((sq, doc))
+        print(f"  跨路去重：{raw_count} 对候选 → {len(collected)} 对唯一片段（节省 {raw_count - len(collected)}）")
         # 关键提速点：全部候选对合并成一个 batch 一次 predict（批量并行），
         # 每对用自己的子查询打分——比逐路 predict 少加载模型、单次推理更快
-        pairs = [(sq, d.page_content) for sq, d in collected]
+        # 明确标注输入输出类型，避免类型检查把 list 推断成 tuple（[List, Document] 元组序）
+        pairs: List[List[str]] = [[sq, d.page_content] for sq, d in collected]
         scores = self._get_cross_encoder().predict(pairs, batch_size=64)
         # 第 3 步：按子查询分组，每路取精排前 per_query_top_n，rank 融合排序
         by_route = {}
@@ -531,15 +629,23 @@ class MultiQueryRetriever(BaseRetriever):
         return [d for d, _ in ranked[: self.top_n]]
 
 
-# 4.1 BM25 关键词检索（内存索引，每次运行由 chunks 现场重建，无需持久化）
+# 4.1 BM25 关键词检索（内存索引，无状态：每次启动从向量库全量取回文本现场重建）
+#     为什么不再用内存 chunks（V8.1 增量索引后的关键联动）：
+#     增量模式下不再有"全量 chunks"（只有变化文件的局部片段），而 BM25 必须拿到
+#     全量文本——向量库恰好存着全量文本，取回即重建。
+#     教学点：向量索引持久化（落盘、可增量维护）/ BM25 无状态（每次现造，不落盘）。
 #     坑：rank_bm25 默认按空格分词，中文整句会被当成一个 token，BM25 直接失效；
 #         必须传入 jieba 分词器（中文场景的关键踩坑点）。
 #     参数名注意：本项目 langchain-community 版本用 preprocess_func（新版独立包才叫 tokenizer）
+_all_docs = vector_store.get(include=["documents", "metadatas"])
+bm25_texts = _all_docs["documents"]
+bm25_metadatas = _all_docs["metadatas"]
+print(f"BM25 从向量库取回 {len(bm25_texts)} 个片段重建（无状态索引）")
 bm25_retriever = BM25Retriever.from_texts(
-    [c.page_content for c in chunks],
+    bm25_texts,
     k=50,
     preprocess_func=lambda t: list(jieba.cut(t)),
-    metadatas=[c.metadata for c in chunks],  # 保留 source 等元数据，方便追溯
+    metadatas=bm25_metadatas,  # 保留 source 等元数据，方便追溯
 )
 
 # 4.2 向量语义检索（现有 Chroma，召回放宽到 50，让 reranker 来精排）
@@ -551,6 +657,10 @@ ensemble_retriever = RRFRetriever(
 )
 
 # 4.4 重排序（bge-reranker 交叉编码器：候选逐条与问题算相关度，精排后只留 top_n 条）
+# 注意：以下实例是【教学保留件】——定义了但没有进当前管道（chain 里用的是 4.5 的
+#       MultiQuery，它内部自带"批量精排 + rank 融合"，把本类的活包进去了）。
+#       保留它只为单独演示"粗召回 → 精排"两段式，或临时替换管道对比单路 vs 多路效果。
+#       删掉它不影响运行（链路照常），想删就删。
 reranker_retriever = RerankerRetriever(
     base_retriever=ensemble_retriever,
     model_name=os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base"),
@@ -561,8 +671,8 @@ reranker_retriever = RerankerRetriever(
 #     LLM 拆分子查询覆盖"不同说法" → 每路独立召回精排 → rank 融合合并。
 #     解决"枚举/聚合类问题"（几个/都有谁）单路检索漏全集——典型案例如
 #     "李云龙妻子有几个"：书里秀芹从不用"妻子"称呼，单路只命中田雨。
-#     RerankerRetriever 保留为单路精排组件（reranker_retriever），
-#     最外层 retriever 换 MultiQuery，管道 `| retriever |` 一行不用改。
+#     RerankerRetriever 保留为单路精排组件（reranker_retriever，教学保留件，未进管道，
+#     见 4.4 标注），最外层 retriever 换 MultiQuery，管道 `| retriever |` 一行不用改。
 retriever = MultiQueryRetriever(
     base_retriever=ensemble_retriever,
     llm=llm,

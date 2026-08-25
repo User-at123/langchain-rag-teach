@@ -14,7 +14,7 @@ cp .env.example .env    # 然后编辑 .env，填入你的 DeepSeek API Key
 
 # 3. 运行
 python main.py    # 普通问答
-python rag.py     # RAG 问答（首次运行会下载嵌入模型并建索引，之后运行秒加载）
+python rag.py     # RAG 问答（首次运行建索引；之后增量更新：只处理新增/变更/删除的文件，V8.1）
 ```
 
 ## 配置说明（.env）
@@ -26,7 +26,8 @@ python rag.py     # RAG 问答（首次运行会下载嵌入模型并建索引�
 | `LLM_MODEL` | 对话模型，默认 `deepseek-chat`（也可填 `deepseek-reasoner`） |
 | `EMBEDDING_MODEL` | 嵌入模型，默认 `BAAI/bge-small-zh-v1.5`（本地开源模型） |
 | `RERANKER_MODEL` | 可选，重排序模型，默认 `BAAI/bge-reranker-base`（首次运行自动下载） |
-| `CHROMA_DIR` | 向量索引存储目录，默认 `./chroma_db`（首次运行创建，之后直接加载） |
+| `CHROMA_DIR` | 向量索引存储目录，默认 `./chroma_db`（首次运行创建，之后增量维护） |
+| `INDEX_STATE_FILE` | 增量索引状态文件，默认 `./.index_state.json`（记录文件指纹，启动时比对差异，V8.1） |
 | `OCR_CACHE_DIR` | OCR 结果缓存目录，默认 `./ocr_cache`（扫描 PDF 识别文本落盘，避免重复 OCR） |
 | `HF_ENDPOINT` | 可选，HuggingFace 国内镜像（`https://hf-mirror.com`），加速/修复模型下载 |
 | `USE_INSECURE_SSL` | 可选，设为 `1` 可跳过 SSL 证书验证（仅教学用，修复证书报错） |
@@ -48,16 +49,14 @@ Windows/公司代理环境的常见问题，二选一解决：
 
 在 `.env` 中取消注释 `HF_ENDPOINT=https://hf-mirror.com`，走国内镜像。
 
-**3. 修改了 docs/ 里的知识库文件，但 rag.py 回答还是旧内容**
+**3. 修改了 docs/ 里的知识库文件，rag.py 会自动感知吗？**
 
-Chroma 索引是持久化的，不会自动感知源文件变化。更新知识库后，
-删掉 `chroma_db` 目录再运行即可重建索引（当前为全量重建模式；
-"增量更新"已规划为方案 B——记录文件指纹，只处理新增/变更的文件）：
-```bash
-rmdir /s /q chroma_db    # Windows（PowerShell 用 Remove-Item -Recurse -Force chroma_db）
-# 或 rm -rf chroma_db    # Mac/Linux
-python rag.py
-```
+V8.1 起会自动增量更新：启动时比对 `.index_state.json` 里的文件指纹（修改时间+大小），
+只处理有变化的文件（新增→嵌入入库、变更→删旧重建、删除→同步删除、未变→跳过）。
+直接运行 `python rag.py` 即可，看启动日志 `增量比对：新增 n 变更 n 删除 n 跳过 n`。
+
+只有一种情况需要留意：**V8.1 之前建的旧索引**（还没有状态文件）——首次运行会自动
+"全量校准"（记录指纹、不重新嵌入），之后自动转增量。
 
 **4. 放了 PDF 进去，但检索 PDF 内容为空**
 
@@ -69,7 +68,7 @@ python rag.py
 - 识别结果会缓存到 `ocr_cache/`（自动创建，无需手动管），下次构建索引直接读缓存，
   不再重跑 OCR
 - 446 页全扫描预计 10~16 分钟（约 1.5~2 秒/页，CPU），属正常（OCR 固有成本，一次性）
-- 改完记得删 `chroma_db` 重建索引
+- V8.1 起改完直接运行 `rag.py` 即可，自动增量更新（不再需要删库重建）
 
 ## 知识库支持格式（docs/ 目录）
 
@@ -136,7 +135,7 @@ RAG = 检索（Retrieval）+ 增强（Augmented）+ 生成（Generation），
 | 加载文档 | `load_documents()`：`os.walk` 遍历 + `LOADER_MAP` 路由 | 扫描 docs/，按扩展名路由到对应加载函数（txt/md/pdf/docx/csv/xlsx）；PDF 逐页判定：扫描页自动 OCR（V8.0，带进度条 + 结果缓存到 ocr_cache/） |
 | 切分 | `split_documents_by_format()` 按格式路由 | 长文本切小块；.md 按标题切、.csv/.xlsx 按行切、其余通用切分 |
 | 嵌入 | `HuggingFaceEmbeddings` | 用本地开源模型把文本转成向量 |
-| 存储 | `Chroma` | 向量库，索引落盘到 `./chroma_db`，重启后直接加载无需重建 |
+| 存储 | `Chroma` | 向量库，索引落盘到 `./chroma_db`；V8.1 起增量维护（`.index_state.json` 记录文件指纹，启动只处理新增/变更/删除的文件；BM25 每次从向量库取回文本重建） |
 | 检索 | `retriever`（V8.2 MultiQuery 多路检索：LLM 拆子查询 → 每路 BM25+向量 RRF 召回 → bge-reranker 精排 → rank 融合合并） | 解决"枚举/集合类问题"（有几个/都有谁）单路检索漏全集：一个问法只匹配一种"说法"，多路拆解覆盖不同说法后合并（实例：李云龙两任妻子 秀芹+田雨 都能召回）。每路内部仍是 BM25 关键词 + 向量语义 + RRF 融合 + reranker 精排。局限：万级全量列举/统计类问题仍靠 SQL（见 mindmap 核心概念 6） |
 | 增强 | 把 `{context}` 塞进提示词 | 让模型"带着资料"作答，并标注来源 |
 
