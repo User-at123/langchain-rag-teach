@@ -34,6 +34,7 @@ from langchain_community.document_loaders import (
 )
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.retrievers import BaseRetriever
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -43,6 +44,8 @@ from langchain_text_splitters import (
     RecursiveCharacterTextSplitter,
 )
 from pydantic import ConfigDict, Field, PrivateAttr
+
+from sql_db import SQLiteDb
 
 # ========== 1. 加载文档（支持多格式） ==========
 # 规则：docs/ 目录里有文件 → 按扩展名路由到对应 Loader 加载全部；
@@ -714,8 +717,114 @@ chain = (
     | llm
 )
 
+# ========== 6.5 第 5 步：Text-to-SQL + 路由器（V9.0）==========
+# 承接 V7.8 认知边界（核心概念 4/6）："列举/聚合/统计"类问题 ≠ Top-k 检索，
+# 万级数据必须走 SQL（检索返回"原文"，SQL 返回"计算结果"）。
+# 本步零新增依赖：SQLite 是标准库（sql_db.py），路由器/SQL 链复用现有 llm。
+# 链路：路由器判断类型 → 事实查询走向量链（上面的 chain）→ 列举/统计走 SQL 链；
+#       SQL 执行失败 → 报错回传 LLM 重写 1 次；空结果/仍失败 → 降级向量链。
+# 术语翻译（"诞生时间"→"创立日期"）不手动维护：schema 只给真实表头 + 样例，
+# 翻译靠 LLM 世界常识一次到位，只有捏造列名才会被 sql_db 的列名校验拦截并重写。
+db = SQLiteDb()
+
+# 6.5.1 路由器：判断问题走 vector（文档检索）还是 sql（数据库查询）
+router_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "你是问题路由器。判断用户问题应该走哪条查询路径，只返回一个词：vector 或 sql。\n\n"
+     "- vector：答案在叙述性文档里（问属性/关系/定义/背景），读几段原文就能答；\n"
+     "  例如\"华信银行的行业是什么\"、\"李云龙的妻子是谁\"。\n"
+     "- sql：需要对表格数据做列举/统计/聚合/排名，必须查数据库才能答；\n"
+     "  例如\"所有客户的行业有哪些\"、\"客户总数是多少\"、\"各行业客户数量排名\"。\n\n"
+     "判断规则：\n"
+     "1. 出现统计/聚合词（多少/几个/总数/合计/平均/最大/最小/排行/排名/占比）→ sql\n"
+     "2. 出现全集列举词（所有/全部/每个/各自/名单/明细/清单）→ sql\n"
+     "3. 其余（是什么/怎么样/为什么/谁/关系/约定/条款）→ vector\n"
+     "4. 不确定时默认 vector（文档检索覆盖面更广，SQL 只覆盖表格数据）"),
+    ("human", "{question}"),
+])
+router_chain = router_prompt | llm | StrOutputParser()
+
+# 6.5.2 Text-to-SQL：问题 + schema（真实表头/样例）→ LLM 生成 SELECT
+sql_gen_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "你是 SQL 生成器。根据表结构把用户问题转成一条 SQLite SELECT 语句。\n\n"
+     "表结构（列名可能与用户说法不同，请按语义匹配最合适的列，\n"
+     "比如用户说\"诞生时间/成立时间\"，表里列名可能是\"创立日期\"）：\n{schema}\n\n"
+     "要求：\n"
+     "- 只输出 SQL 语句本身，不要任何解释\n"
+     "- 只允许 SELECT，禁止 INSERT/UPDATE/DELETE/DROP\n"
+     "- 中文值要加单引号，表名/列名不要加引号\n"
+     "- 如果问题与表结构完全无关，只输出：NULL\n\n"
+     "示例：\n"
+     "问：所有客户的行业有哪些？\n"
+     "答：SELECT DISTINCT 行业 FROM customers\n"
+     "问：客户总数是多少？\n"
+     "答：SELECT COUNT(*) FROM customers"),
+    ("human", "{question}"),
+])
+
+# 6.5.3 SQL 执行失败时的重写提示词（报错回传，最多重试 1 次）
+sql_retry_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "你生成的 SQL 执行失败。请根据错误信息和表结构重新生成一条 SQLite SELECT 语句。\n\n"
+     "表结构：\n{schema}\n"
+     "你上次的 SQL：{sql}\n"
+     "错误信息：{error}\n\n"
+     "只输出修正后的 SQL 语句本身，不要解释。"),
+    ("human", "{question}"),
+])
+
+
+def format_sql_result(cols, rows):
+    """SQL 查询结果直接格式化成文本（纯拼接，不额外调 LLM 省 token）。
+    注意：rows 是 dict 列表，取值必须用 r[c]——zip(cols, r) 迭代 dict 会
+    取到键而不是值（踩过的坑：输出全变成列名）。"""
+    parts = [f"[数据库查询] 共 {len(rows)} 条结果："]
+    for r in rows:
+        parts.append("  " + " | ".join(f"{c}: {r[c]}" for c in cols))
+    return "\n".join(parts)
+
+
+def sql_answer(question):
+    """SQL 链：生成 SQL → 执行 → 报错重写 1 次；空结果/失败返回 None 由门面降级。"""
+    schema = db.schema_text()
+    sql = (sql_gen_prompt | llm | StrOutputParser()).invoke(
+        {"question": question, "schema": schema}
+    ).strip()
+    print(f"  [SQL 链] 生成的 SQL：{sql}")
+    if sql.upper() == "NULL":
+        return None  # LLM 判断与表无关
+    try:
+        cols, rows = db.query(sql)
+    except Exception as e:
+        retry = (sql_retry_prompt | llm | StrOutputParser()).invoke(
+            {"question": question, "schema": schema, "sql": sql, "error": str(e)}
+        ).strip()
+        print(f"  [SQL 链] 重写：{retry}")
+        try:
+            cols, rows = db.query(retry)
+        except Exception as e2:
+            print(f"  [SQL 链] 重写后仍失败，降级向量检索：{e2}")
+            return None
+    if not rows:
+        return None  # 空结果：数据可能不在表里 → 交给向量链
+    return format_sql_result(cols, rows)
+
+
+def ask(question):
+    """门面：单一入口。路由器分流 vector/sql，SQL 失败自动降级向量链。"""
+    route = router_chain.invoke({"question": question}).strip()
+    print(f"  [路由器] 问题类型：{route}")
+    if route == "sql":
+        ans = sql_answer(question)
+        if ans is not None:
+            return ans
+        print("  [路由器] SQL 链无结果，降级向量检索")
+    return chain.invoke({"question": question}).content
+
+
 # ========== 7. 运行 ==========
 if __name__ == "__main__":
     question = input("请输入你的问题（关于知识库内容）：")
-    response = chain.invoke({"question": question})
-    print(f"\n回答：{response.content}")
+    response = ask(question)
+    print(f"\n回答：{response}")

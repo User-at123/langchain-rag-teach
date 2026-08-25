@@ -105,13 +105,21 @@ V8.1 起会自动增量更新：启动时比对 `.index_state.json` 里的文件
 > 召回 + 精排（每路用【自己的子查询】打分），rank 融合合并去重。手写 MultiQueryRetriever
 >（复用已有 CrossEncoder/ChatOpenAI，零新增依赖）。代价：每次问答多一次 LLM 调用
 >（拆分子查询，约 1~2 秒）——换"枚举/集合类问题不漏全集"。
+>
+> **Text-to-SQL + 路由器（V9.0）**：万级"列举/统计"问题（所有客户的行业/总数/排名）
+> 靠 Top-k 检索答不全（核心概念 4/6：检索返回"原文"、SQL 返回"计算结果"）。
+> 解法：xlsx 自动导入 SQLite（sql_db.py，零新增依赖）→ LLM 路由器分流
+> vector/sql → SQL 链（问题 + schema → LLM 生成 SELECT → 执行 → 格式化）。
+> 术语翻译（"诞生时间"→"创立日期"）靠 LLM 常识零维护；只读 SELECT 白名单 +
+> 中文列名校验防注入；SQL 报错回传重写 1 次，空结果/失败自动降级向量链。
 
 ## 代码结构
 
 | 文件 | 作用 |
 | --- | --- |
 | `main.py` | 普通问答：加载配置 → 创建模型 → 定义提示词 → 组合成链 → 运行 |
-| `rag.py` | RAG 问答：多格式知识库 → 切分 → 嵌入 → Chroma 检索 → 生成 |
+| `rag.py` | RAG 问答：多格式知识库 → 切分 → 嵌入 → Chroma 检索 → 生成；V9.0 起入口 `ask()` 带 LLM 路由器（vector/sql）分流 |
+| `sql_db.py` | Text-to-SQL 数据层（V9.0）：xlsx → SQLite 建库导入 + 只读 SELECT 执行器 + 中文列名校验 + schema 文本生成（零新增依赖） |
 | `knowledge_base.txt` | 单文件知识库（docs/ 为空时的回退来源） |
 | `docs/` | 多格式知识库目录（txt/md/pdf/docx/csv/xlsx） |
 | `requirements.txt` | 依赖清单 |
@@ -138,6 +146,7 @@ RAG = 检索（Retrieval）+ 增强（Augmented）+ 生成（Generation），
 | 存储 | `Chroma` | 向量库，索引落盘到 `./chroma_db`；V8.1 起增量维护（`.index_state.json` 记录文件指纹，启动只处理新增/变更/删除的文件；BM25 每次从向量库取回文本重建） |
 | 检索 | `retriever`（V8.2 MultiQuery 多路检索：LLM 拆子查询 → 每路 BM25+向量 RRF 召回 → bge-reranker 精排 → rank 融合合并） | 解决"枚举/集合类问题"（有几个/都有谁）单路检索漏全集：一个问法只匹配一种"说法"，多路拆解覆盖不同说法后合并（实例：李云龙两任妻子 秀芹+田雨 都能召回）。每路内部仍是 BM25 关键词 + 向量语义 + RRF 融合 + reranker 精排。局限：万级全量列举/统计类问题仍靠 SQL（见 mindmap 核心概念 6） |
 | 增强 | 把 `{context}` 塞进提示词 | 让模型"带着资料"作答，并标注来源 |
+| 路由 | `ask()` 门面 + `router_chain`（V9.0） | LLM 判断问题类型：事实查询走检索链，列举/统计/聚合走 SQL 链（`sql_db.py`），SQL 失败自动降级检索链 |
 
 **建议体验**：先用 `main.py` 问"星辰科技是哪年成立的"（模型不知道，会编造），
 再用 `rag.py` 问同样的问题，可以看到它基于知识库给出正确回答。

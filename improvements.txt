@@ -291,7 +291,7 @@ LangChain 教学项目 · 可改进方向与思路笔记
    - 注意：每次问答多一次 LLM 调用（拆子查询约 1~2 秒）；万级"列举/统计"问题仍走 SQL
      （MultiQuery 让 Top-k 更"全"，但原文进提示词的物理限制不变，见 mindmap 核心概念 4）
 [待做] 第 4 步：视频字幕/语音转写接入，先做最简单的 srt 解析
-[待做] 第 5 步：Text-to-SQL + 路由器（智能分流：向量检索 vs SQL 查询）
+[已完成] 第 5 步：Text-to-SQL + 路由器（V9.0，2026-08-25 实施并验证）
    - 为什么排在 FastAPI 之前：封装应一次到位暴露完整能力；先封装纯向量版、
      后面再加 SQL 会导致接口和前端返工（"列举/统计"类问题必须走 SQL）
    - 数据库：先用 SQLite 起步（零配置、单文件，Python 内置 sqlite3），
@@ -303,6 +303,21 @@ LangChain 教学项目 · 可改进方向与思路笔记
      FastAPI 阶段依然是 POST /ask 一个接口
    - 安全：LLM 生成的 SQL 只允许 SELECT（只读白名单/最小权限），防止注入
    - 承接：V7.8 认知边界中"列举/聚合类问题 ≠ Top-k 检索"的生产级正解
+   - 实际落地（对比原规划的调整）：
+     * 手写 sql_db.py 代替 RunnableBranch（教学优先，零新增依赖：
+       sqlite3 标准库 + openpyxl 已有，全部手写约 100 行）
+     * 术语翻译不手动维护 schema 别名——"诞生时间"→"创立日期"靠 LLM 世界常识
+       一次调用内化（常识推理不额外收 token）；只有捏造列名才被
+       中文列名校验拦截 → 报错回传 LLM 重写 1 次 → 空结果/失败降级向量链
+     * 实测 6 类问题全过：DISTINCT 列举 / COUNT 统计 / GROUP BY+ORDER BY 排名 /
+       WHERE 条件 / 事实查询(vector) / 文本问题(vector)
+   - 踩坑记录（详见 mindmap V9.0）：
+     * format_sql_result 里 zip(cols, r) 迭代 dict 取到键不是值，结果全变列名
+     * GROUP BY ... AS 中文别名被列名校验误拦 → 校验放行 AS 别名
+     * 已知边界：路由器对"条件筛选 + 具体值"偶判 vector（当前数据量小能命中，
+       数据量变大需补"字段条件 → sql"规则）
+   - 注意事项：data.db 由 xlsx 自动导入（幂等），已加 .gitignore；
+     xlsx 变更后需删 data.db 重导（SQLite 层暂无增量）
 [待做] 第 6 步：FastAPI 封装 + 简单前端页面（封装完整能力，含 SQL 路由）
 [待做] 第 7 步：建立 assets/logo 素材目录规范          （为海报生成做准备）
 [待做] 第 8 步：海报/文案生成模块（先做文案，再做图片；logo 用程序化叠加）

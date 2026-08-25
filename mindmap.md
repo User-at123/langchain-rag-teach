@@ -97,11 +97,18 @@ LangChain 教学项目
 │   ├── 实现：收集候选时按 page_content 去重（约 5 行），同一片段只打一次分
 │   └── 实测：100 → 53 对，invoke 6.5s，回答质量不变
 │
+├── V9.0 Text-to-SQL + 路由器（第 5 步，已提交）
+│   ├── 场景：万级"列举/统计"问题 Top-k 答不全（核心概念 4/6：检索给原文、SQL 给计算结果）
+│   ├── 实现：SQLite 建库导入 xlsx（sql_db.py）→ LLM 路由器分流 vector/sql → SQL 链
+│   ├── 关键设计：术语翻译交 LLM 常识（诞生时间→创立日期）零维护；SQL 报错回传重写 1 次；
+│   │          空结果/失败降级向量链；只读 SELECT 白名单 + 中文列名校验防注入
+│   └── 零新增依赖：sqlite3 标准库 + openpyxl 已有（全部手写 ~100 行）
+│
 └── V8+ 未来规划（见 improvements.txt）
     ├── 3   已提交（V7.9）：BM25 混合检索 + bge-reranker 重排序
     ├── 3.5 已提交（V8.0）：扫描件 PDF 自动 OCR（PyMuPDF + RapidOCR）
     ├── 4   视频字幕 srt / 语音转写接入
-    ├── 5   Text-to-SQL + 路由器（问题分流：向量 vs SQL；SQLite 起步 → MySQL）
+    ├── 5   已提交（V9.0）：Text-to-SQL + 路由器（SQLite 起步，MySQL 只改连接串）
     ├── 6   FastAPI 封装 + 前端页面（封装完整能力，含 SQL 路由）
     ├── 7   assets/logo 素材目录规范
     ├── 8   海报 / 文案生成（logo 程序化叠加）
@@ -549,6 +556,39 @@ LOADER_MAP = {
 
 ---
 
+### V9.0 Text-to-SQL + 路由器（第 5 步，已提交）
+
+**改动内容**
+- 承接 V7.8 认知边界（核心概念 4/6）：万级"列举/统计/聚合"问题必须走 SQL——
+  检索返回"原文"（1 万条塞不进提示词），SQL 返回"计算结果"（体积被压缩）
+- 新增 sql_db.py（数据层，零新增依赖：sqlite3 标准库 + openpyxl 已有）：
+  - 建库导入：表名 = sheet 名，列名 = xlsx 表头（与 load_xlsx 同源），幂等（有数据跳过）
+  - 只读执行器：单条 SELECT 白名单 + 中文列名校验（防注入 + 防 LLM 捏造列名）
+  - schema 文本：动态生成"表头 + 样例数据"，供 Text-to-SQL 提示词使用
+- 链路：LLM 路由器（vector/sql 二选一）→ 事实查询走向量链（原 chain 一行不改）
+  → 列举/统计走 SQL 链（问题 + schema → LLM 生成 SELECT → 执行 → 格式化结果）
+- 降级设计（省 token 的关键）：术语翻译内化在一次调用里（LLM 常识不额外收费）→
+  SQL 执行报错才回传重写 1 次 → 空结果/仍失败降级向量链 → 如实说明
+- 术语翻译零维护："诞生时间"→"创立日期"靠 LLM 世界常识，不手动维护 schema 别名；
+  只有捏造列名才会被列名校验拦截，触发报错重写
+- 实测 6 类问题全过：列举（DISTINCT）/ 统计（COUNT）/ 排名（GROUP BY + ORDER BY）/
+  条件（WHERE 年份）/ 事实（vector）/ 文本（vector）
+
+**踩坑记录**
+- dict 迭代取键：format_sql_result 里 zip(cols, r) 迭代 dict 得到的是键不是值，
+  导致查询结果全部显示成列名（直接 print dict 正常、格式化输出全错）→ 改用 r[c]
+- AS 别名误拦：GROUP BY ... AS 客户数量 的中文别名被列名校验拦截 →
+  校验放行 AS 别名（别名是临时标识符，不是捏造列名）
+- 已知边界：路由器对"条件筛选 + 具体值"（哪些公司是2022年合作的）偶尔判 vector，
+  当前 xlsx 数据量小能命中；数据量变大时需要补"字段条件 → sql"路由规则
+
+**注意事项**
+- data.db 由 xlsx 自动导入、可删除重建（已加 .gitignore）；xlsx 变更后需删 data.db
+  重导（SQLite 层暂无增量，向量层有 V8.1）
+- 与第 9 步的关系：跨轮状态（"基于刚才导出的第 3 条"）需要 memory，届时路由器升级三路
+
+---
+
 ### V8+ 未来规划（详见 improvements.txt）
 
 | 步骤 | 内容 | 关键工具 |
@@ -556,7 +596,7 @@ LOADER_MAP = {
 | 3 | BM25 混合检索 + 重排序（✅ 已提交 V7.9） | 手写 RRFRetriever / RerankerRetriever（bge-reranker） |
 | 3.5 | 扫描件 PDF 自动 OCR（✅ 已提交 V8.0） | PyMuPDF 渲染 + RapidOCR 离线识别 |
 | 4 | 视频字幕 / 语音转写 | srt 解析 / faster-whisper |
-| 5 | Text-to-SQL + 路由器（问题分流） | SQLite 起步 → MySQL / RunnableBranch |
+| 5 | Text-to-SQL + 路由器（✅ 已提交 V9.0） | SQLite 起步 → MySQL 只改连接串 |
 | 6 | FastAPI 封装 + 前端（封装完整能力） | FastAPI / 简单网页 |
 | 7 | assets/logo 素材规范 | 本地目录 → 对象存储 |
 | 8 | 海报 / 文案生成 | LLM 文案 + 程序化叠加 logo |
@@ -939,6 +979,35 @@ CPU 密集的模型推理 → batch（合并样本一次算）；远程 API → 
 
 ---
 
+### 核心概念 12：用户说法与库内表示之间隔着一道"翻译层"——检索靠多路覆盖、SQL 靠预置映射
+
+> 为什么 V9.0 里"诞生时间"能查到"创立日期"列，而 MultiQuery 那种拆问法的方式却做不到？
+
+**现象（本项目两个版本踩的是同一类问题）**：
+- V8.2 文本检索："李云龙妻子"只命中"妻子"的说法，"婆娘/娶媳妇"靠 MultiQuery
+  拆多路问法覆盖——因为检索容忍模糊，多路总有一路命中
+- V9.0 SQL："每个公司的诞生时间"→ 表里列名是"创立日期"。SQL 是精确查询，
+  **不能拆多路**，列名写错直接报错或返回空
+
+**两种翻译机制（同源问题、不同解法）**：
+
+| 场景 | 翻译方式 | 原理 | 失败兜底 |
+| --- | --- | --- | --- |
+| 检索（vector/BM25） | 多路覆盖 | 拆多个说法各查一路（检索天生容忍模糊） | 多路总有一路命中 |
+| 查询（SQL） | LLM 常识映射 | schema 给真实列名 + 样例，LLM 用世界常识现场对齐 | 列名校验 → 报错重写 → 降级向量 |
+
+**关键认知（本项目 V9.0 实战结论）**：
+- LLM 的"常识翻译"是默认能力、不额外收 token（API 按调用次数收费，不按"思考量"）——
+  所以 SQL 链**不用**"先严格后常识"两档调用，一次调用内化翻译即可（省一次 schema 输入）
+- 该手动维护的不是"全量 schema 别名"，而是"LLM 翻车列的补丁"（按需，从 0 增长）
+- 捏造列名才是硬错误：中文列名校验（中文不可能是 SQL 关键字）100% 可靠拦截
+
+**本项目实例**：`SELECT 诞生时间 FROM 客户案例` 被 sql_db 拦截（标识符不在任何表）→
+报错回传 LLM 重写为 `SELECT 创立日期 ...`；重写仍错或空结果 → 降级向量链——
+三层兜底保证用户永远不会看到 SQL 报错。
+
+---
+
 ## 四、依赖包清单（当前 requirements.txt）
 
 | 包 | 作用 | 对应功能 | 备注 |
@@ -960,6 +1029,7 @@ CPU 密集的模型推理 → batch（合并样本一次算）；远程 API → 
 | `jieba` | 中文分词 | BM25 中文预处理（preprocess_func） | V7.9 新增 |
 | `sentence-transformers` | 嵌入模型底层 | bge-small-zh 运行环境 + bge-reranker 交叉编码 | |
 | `python-dotenv` | 环境变量 | `load_dotenv()` 读 .env | |
+| `sqlite3` | SQLite 数据库（**Python 标准库**） | `SQLiteDb` 建库/查询（sql_db.py） | V9.0 无需安装 |
 
 ---
 
@@ -1035,3 +1105,4 @@ pip install -r requirements.txt
 | （已提交） | 扫描件 PDF 自动 OCR + 进度条 + 结果缓存（PyMuPDF + RapidOCR + tqdm） | V8.0 |
 | （已提交） | MultiQuery 多路检索：LLM 拆子查询 + 每路独立精排 + rank 融合合并（手写，零新依赖） | V8.2 |
 | （已提交） | MultiQuery 跨路去重：收集候选按 page_content 去重，打分对数 100→53（规划 C 第 1 项） | V8.3 |
+| （已提交） | Text-to-SQL + 路由器：SQLite 建库导入 xlsx + LLM 路由分流 vector/sql + SQL 链降级（sql_db.py，零新依赖） | V9.0 |

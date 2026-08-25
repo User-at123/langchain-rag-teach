@@ -18,3 +18,6 @@ ocr_cache/
 
 # 增量索引状态文件（V8.1：记录每个文件的指纹，运行时可自动重建，不提交）
 .index_state.json
+
+# SQLite 数据库（V9.0：由 docs/ 下 xlsx 自动导入重建，不提交）
+data.db
