@@ -59,26 +59,26 @@ LangChain 教学项目
 │   ├── 试错：MMR 检索反而把结构相似的客户案例行当"重复"丢弃
 │   └── 定稿：普通相似度检索 + k=6，3 条案例行全进候选，模型能汇总出完整列表
 │
-├── V7.8 认知边界记录（纯文档，无代码改动）
+├── V7.8 认知边界记录（纯文档，已提交）
 │   ├── k=6 只是当前 10 个片段知识库的调优值，不是通用解
 │   ├── "列举/聚合"类问题 ≠ Top-k 检索问题（见核心概念 4）
 │   ├── 三档正解：整表引用 → 分批聚合 → Text-to-SQL（生产级）
 │   └── 补充：引用"上一轮导出结果"的推理 ≠ 检索（走 memory，见核心概念 5 / 第 9 步）
 │
-├── V7.9 混合检索 + 重排序（第三阶段，待提交）
+├── V7.9 混合检索 + 重排序（第三阶段，已提交）
 │   ├── 单一向量检索 → BM25 + 向量 + RRF 融合 + bge-reranker 精排
 │   ├── k 的职责：从"回答视野"（V7.7）降级为"粗筛漏斗"，精排后定视野
 │   ├── 坑：langchain-retrievers 包装不上 → 手写 RRFRetriever / RerankerRetriever
 │   └── 坑：BM25 中文必须接 jieba 分词（preprocess_func 参数）
 │
-├── V8.0 OCR 扫描件加载（待提交）
+├── V8.0 OCR 扫描件加载（已提交）
 │   ├── 场景：docs/ 放入扫描版 PDF（每页是图片、无文字层），检索结果为空
 │   ├── load_pdf 升级：逐页判定——文字层够的页直接用；扫描页 PyMuPDF 渲染成位图 + RapidOCR 离线识别
 │   ├── OCR 模型懒加载：只影响扫描件，普通文字版 PDF 启动不拖慢
 │   ├── OCR 进度可视化（tqdm 进度条）+ OCR 结果缓存（ocr_cache/，二次构建不重跑）
 │   └── 新增依赖：PyMuPDF / rapidocr-onnxruntime / Pillow / tqdm
 │
-├── V8.1 增量索引（已完成）
+├── V8.1 增量索引（已提交）
 │   ├── 场景：加新文件必须删库重建、扫描 PDF 每次全量重 OCR（最贵一环反复支付）
 │   ├── 实现：.index_state.json 记录文件指纹（mtime+size）→ 启动三向比对
 │   │        （新增/变更/删除/跳过），只处理有变化的文件，其余零成本跳过
@@ -86,20 +86,20 @@ LangChain 教学项目
 │   │        （教学点：向量索引持久化 / BM25 无状态，见核心概念 11）
 │   └── 实测：加文件只处理该文件、改文件只重建该文件、问答质量不变
 │
-├── V8.2 MultiQuery 多路检索（已完成）
+├── V8.2 MultiQuery 多路检索（已提交）
 │   ├── 场景：《亮剑》"李云龙妻子有几个"只答田雨——漏了秀芹（书里有两位）
 │   ├── 根因：一个问法只匹配一种"说法"——"妻子"命中田雨，秀芹是"婆娘/娶媳妇"
 │   ├── 实现：LLM 拆子查询（集合类逐成员拆）→ 每路独立召回精排 → rank 融合合并
 │   └── 纯手写：复用 CrossEncoder/ChatOpenAI，零新增依赖（详见核心概念 9/10）
 │
-├── V8.3 MultiQuery 性能优化：跨路去重（已完成，规划 C 第 1 项）
+├── V8.3 MultiQuery 性能优化：跨路去重（已提交，规划 C 第 1 项）
 │   ├── 场景：5 路子查询是同一问题的不同问法，命中的语料高度重叠——重复率实测 47%
 │   ├── 实现：收集候选时按 page_content 去重（约 5 行），同一片段只打一次分
 │   └── 实测：100 → 53 对，invoke 6.5s，回答质量不变
 │
 └── V8+ 未来规划（见 improvements.txt）
-    ├── 3   已完成（V7.9）：BM25 混合检索 + bge-reranker 重排序
-    ├── 3.5 已完成（V8.0）：扫描件 PDF 自动 OCR（PyMuPDF + RapidOCR）
+    ├── 3   已提交（V7.9）：BM25 混合检索 + bge-reranker 重排序
+    ├── 3.5 已提交（V8.0）：扫描件 PDF 自动 OCR（PyMuPDF + RapidOCR）
     ├── 4   视频字幕 srt / 语音转写接入
     ├── 5   Text-to-SQL + 路由器（问题分流：向量 vs SQL；SQLite 起步 → MySQL）
     ├── 6   FastAPI 封装 + 前端页面（封装完整能力，含 SQL 路由）
@@ -108,7 +108,7 @@ LangChain 教学项目
     ├── 9   多轮记忆 + 跨轮状态（路由三路：vector / sql / memory）
     ├── 10  Agent 工具化（query_sql / retrieve_vector / read_memory 自主编排）
     ├── 11  依赖解耦重构（方案 A，待实施）：去掉 langchain-community，手写薄封装
-    └── 12  已完成（V8.1）：增量索引——.index_state.json + 文件级差异，免全量重建
+    └── 12  已提交（V8.1）：增量索引——.index_state.json + 文件级差异，免全量重建
 ```
 
 ---
@@ -373,7 +373,7 @@ LOADER_MAP = {
 
 ---
 
-### V7.9 混合检索 + 重排序（第三阶段，待提交）
+### V7.9 混合检索 + 重排序（第三阶段，已提交）
 
 **改动内容**
 - 单一向量检索（`retriever = vector_store.as_retriever(k=6)`）→ 三环节流水线：
@@ -417,7 +417,7 @@ LOADER_MAP = {
 
 ---
 
-### V8.0 OCR 扫描件加载（待提交）
+### V8.0 OCR 扫描件加载（已提交）
 
 **改动内容**
 - 背景：用户向 `docs/` 放入扫描版《亮剑》PDF（446 页），检索结果为空——
@@ -476,7 +476,7 @@ LOADER_MAP = {
 
 ---
 
-### V8.2 MultiQuery 多路检索（待提交）
+### V8.2 MultiQuery 多路检索（已提交）
 
 **改动内容**
 - 背景：问《亮剑》"李云龙妻子一共有几个"只答出田雨——书里明确有两位妻子（秀芹 + 田雨）
@@ -526,7 +526,7 @@ LOADER_MAP = {
 
 ---
 
-### V8.3 MultiQuery 性能优化：跨路去重（已完成，规划 C 第 1 项）
+### V8.3 MultiQuery 性能优化：跨路去重（已提交，规划 C 第 1 项）
 
 **改动内容**
 - 背景：V8.2 的 recall_top_n=20 已把候选砍到 100 对（250→100，24.6s→10.2s），
@@ -553,8 +553,8 @@ LOADER_MAP = {
 
 | 步骤 | 内容 | 关键工具 |
 | --- | --- | --- |
-| 3 | BM25 混合检索 + 重排序（✅ 已完成 V7.9） | 手写 RRFRetriever / RerankerRetriever（bge-reranker） |
-| 3.5 | 扫描件 PDF 自动 OCR（✅ 已完成 V8.0） | PyMuPDF 渲染 + RapidOCR 离线识别 |
+| 3 | BM25 混合检索 + 重排序（✅ 已提交 V7.9） | 手写 RRFRetriever / RerankerRetriever（bge-reranker） |
+| 3.5 | 扫描件 PDF 自动 OCR（✅ 已提交 V8.0） | PyMuPDF 渲染 + RapidOCR 离线识别 |
 | 4 | 视频字幕 / 语音转写 | srt 解析 / faster-whisper |
 | 5 | Text-to-SQL + 路由器（问题分流） | SQLite 起步 → MySQL / RunnableBranch |
 | 6 | FastAPI 封装 + 前端（封装完整能力） | FastAPI / 简单网页 |
@@ -563,7 +563,7 @@ LOADER_MAP = {
 | 9 | 多轮记忆 + 跨轮状态（引用上轮结果） | ChatMessageHistory / 会话状态 |
 | 10 | Agent 工具化（多步任务自主编排） | query_sql / retrieve_vector / read_memory |
 | 11 | 依赖解耦重构（方案 A，已记录待实施） | 手写 5 个加载器 + BM25Retriever，去掉 langchain-community |
-| 12 | 增量索引（✅ 已完成 V8.1） | .index_state.json + Chroma 按 source 增删，免全量重建 |
+| 12 | 增量索引（✅ 已提交 V8.1） | .index_state.json + Chroma 按 source 增删，免全量重建 |
 
 **规划 A：依赖解耦重构（已记录，待实施；2026-08 记录，今日不改代码）**
 - 动机：`langchain-community` 已官宣 sunset（rag.py 每次运行都有 DeprecationWarning）；
@@ -1031,7 +1031,7 @@ pip install -r requirements.txt
 | （已提交） | xlsx 表头拼接修复（字段名拼进数据行） | V7.6 |
 | （已提交） | 检索参数调优：k=2 → k=6（修复列举类问题答不全） | V7.7 |
 | （已提交） | 认知边界记录：列举类问题 ≠ Top-k 检索（纯文档） | V7.8 |
-| （待提交） | BM25 混合检索 + RRF 融合 + bge-reranker 精排（第三阶段） | V7.9 |
-| （待提交） | 扫描件 PDF 自动 OCR + 进度条 + 结果缓存（PyMuPDF + RapidOCR + tqdm） | V8.0 |
-| （待提交） | MultiQuery 多路检索：LLM 拆子查询 + 每路独立精排 + rank 融合合并（手写，零新依赖） | V8.2 |
-| （待提交） | MultiQuery 跨路去重：收集候选按 page_content 去重，打分对数 100→53（规划 C 第 1 项） | V8.3 |
+| （已提交） | BM25 混合检索 + RRF 融合 + bge-reranker 精排（第三阶段） | V7.9 |
+| （已提交） | 扫描件 PDF 自动 OCR + 进度条 + 结果缓存（PyMuPDF + RapidOCR + tqdm） | V8.0 |
+| （已提交） | MultiQuery 多路检索：LLM 拆子查询 + 每路独立精排 + rank 融合合并（手写，零新依赖） | V8.2 |
+| （已提交） | MultiQuery 跨路去重：收集候选按 page_content 去重，打分对数 100→53（规划 C 第 1 项） | V8.3 |
