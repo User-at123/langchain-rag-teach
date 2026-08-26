@@ -15,6 +15,7 @@
 import os
 import re
 import sqlite3
+import threading
 
 from openpyxl import load_workbook
 
@@ -24,8 +25,12 @@ DB_PATH = os.getenv("DB_PATH", "./data.db")
 
 class SQLiteDb:
     def __init__(self, db_path=DB_PATH, docs_dir=DOCS_DIR):
-        self.conn = sqlite3.connect(db_path)
+        # check_same_thread=False：FastAPI 的同步接口跑在线程池里，
+        # 请求线程和创建连接的主线程不是同一个，必须允许跨线程使用；
+        # 并发安全靠 self._lock 保证（同一时刻只有一个线程访问连接）。
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
         self._import_xlsx_files(docs_dir)
         print(f"SQLite 就绪：{db_path}（表：{self._tables()}）")
 
@@ -95,9 +100,10 @@ class SQLiteDb:
         if not stmt.upper().startswith("SELECT"):
             raise ValueError("只允许 SELECT 查询（只读白名单）")
         self._validate_identifiers(stmt)
-        cur = self.conn.execute(stmt)
-        cols = [d[0] for d in cur.description]
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        with self._lock:
+            cur = self.conn.execute(stmt)
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
         return cols, rows
 
     def _validate_identifiers(self, sql):
@@ -122,14 +128,15 @@ class SQLiteDb:
     def schema_text(self, sample_rows=2):
         """动态生成表结构描述：每个表的列名 + 前几行样例数据。"""
         parts = []
-        for t in self._tables():
-            cols = self._columns(t)
-            sample = self.conn.execute(
-                f'SELECT * FROM "{t}" LIMIT {sample_rows}'
-            ).fetchall()
-            parts.append(f'表 "{t}"，列: {", ".join(cols)}')
-            for row in sample:
-                parts.append(
-                    "  样例: " + " | ".join(f"{c}: {v}" for c, v in zip(cols, row))
-                )
+        with self._lock:
+            for t in self._tables():
+                cols = self._columns(t)
+                sample = self.conn.execute(
+                    f'SELECT * FROM "{t}" LIMIT {sample_rows}'
+                ).fetchall()
+                parts.append(f'表 "{t}"，列: {", ".join(cols)}')
+                for row in sample:
+                    parts.append(
+                        "  样例: " + " | ".join(f"{c}: {v}" for c, v in zip(cols, row))
+                    )
         return "\n".join(parts)

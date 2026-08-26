@@ -104,12 +104,19 @@ LangChain 教学项目
 │   │          空结果/失败降级向量链；只读 SELECT 白名单 + 中文列名校验防注入
 │   └── 零新增依赖：sqlite3 标准库 + openpyxl 已有（全部手写 ~100 行）
 │
+├── V10.0 FastAPI 封装 + 极简深色前端（第 6 步，已提交）
+│   ├── 场景：CLI 问答 → Web 服务；同一局域网手机/其他主机也能访问
+│   ├── 实现：app.py（POST /ask 复用 ask() 门面，零逻辑重复）+ templates/index.html（单文件内嵌 CSS/JS）
+│   ├── 关键坑：FastAPI 同步接口跑在线程池 → SQLite 连接跨线程报错 →
+│   │          sqlite3.connect(check_same_thread=False) + threading.Lock 兜底
+│   └── 新增依赖：fastapi / uvicorn；--host 0.0.0.0 支持局域网访问
+│
 └── V8+ 未来规划（见 improvements.txt）
     ├── 3   已提交（V7.9）：BM25 混合检索 + bge-reranker 重排序
     ├── 3.5 已提交（V8.0）：扫描件 PDF 自动 OCR（PyMuPDF + RapidOCR）
     ├── 4   视频字幕 srt / 语音转写接入
     ├── 5   已提交（V9.0）：Text-to-SQL + 路由器（SQLite 起步，MySQL 只改连接串）
-    ├── 6   FastAPI 封装 + 前端页面（封装完整能力，含 SQL 路由）
+    ├── 6   已提交（V10.0）：FastAPI 封装 + 前端页面（含 SQL 路由）
     ├── 7   assets/logo 素材目录规范
     ├── 8   海报 / 文案生成（logo 程序化叠加）
     ├── 9   多轮记忆 + 跨轮状态（路由三路：vector / sql / memory）
@@ -589,6 +596,46 @@ LOADER_MAP = {
 
 ---
 
+### V10.0 FastAPI 封装 + 极简深色前端（第 6 步，已提交）
+
+**改动内容**
+- 新增 `app.py`（FastAPI 服务）：
+  - `POST /ask`：接收 `{"question"}` → 复用 `rag.py` 的 `ask()` 门面 → 返回 `{"answer"}`
+    （第 5 步"单一入口"设计直接兑现，服务层零逻辑重复）
+  - `GET /`：返回前端页面（HTMLResponse 读文件，无静态资源依赖）
+  - `GET /health`：健康检查（局域网设备先访问它确认服务在线）
+- 新增 `templates/index.html`：单文件内嵌 CSS/JS，GitHub Dark 极简深色风格，
+  viewport 移动端适配，Enter 发送，fetch 调 /ask 异步渲染气泡
+- 生命周期设计：`from rag import ask` 在服务启动时触发一次初始化
+  （加载文档/建索引/建 SQLite），之后每个请求复用——RAG 重活只做一次
+
+**踩坑记录（重点）**
+- SQLite 跨线程：FastAPI 同步接口跑在【线程池】里，SQLite 连接在主线程创建，
+  默认 `check_same_thread=True` → 请求报 "SQLite objects created in a thread can
+  only be used in that same thread"。CLI 单线程从未暴露，Web 一请求就炸。
+  修复：`sqlite3.connect(db_path, check_same_thread=False)` + `threading.Lock`
+  包住 `query()` 和 `schema_text()`（请求线程会访问的两个方法）
+- pip 装错环境：首次安装 fastapi 装进了全局 Python（import 不到），
+  项目是独立 .venv → 必须用 `.venv\Scripts\python -m pip install` 装进虚拟环境
+
+**新增依赖**
+- `fastapi`（Web 框架）、`uvicorn`（ASGI 服务器）
+
+**验证结果**
+- 冒烟脚本：起服务 → /health 200 → 首页 200（含标题）→ 空问题 400 →
+  正常问题 200（"所有客户的行业有哪些"SQL 链返回 3 行：金融/零售/教育）✅
+- 临时脚本 `_smoke_test.py` 验证后已删除（项目惯例）
+
+**注意事项**
+- 启动命令：`python app.py`（等价于 `python -m uvicorn app:app --host 0.0.0.0 --port 8000`，
+  app.py 末尾有 if __name__ == "__main__" 入口）
+  （--host 0.0.0.0 才支持局域网访问；本机 127.0.0.1，其他设备用电脑局域网 IP）
+- Windows 防火墙首次会弹窗询问是否放行 8000 端口，需允许
+- 前端是"一个接口 + 一个页面"的最小形态，第 9/10 步（记忆/Agent）接入时
+  只需扩展 /ask 或新增接口
+
+---
+
 ### V8+ 未来规划（详见 improvements.txt）
 
 | 步骤 | 内容 | 关键工具 |
@@ -597,7 +644,7 @@ LOADER_MAP = {
 | 3.5 | 扫描件 PDF 自动 OCR（✅ 已提交 V8.0） | PyMuPDF 渲染 + RapidOCR 离线识别 |
 | 4 | 视频字幕 / 语音转写 | srt 解析 / faster-whisper |
 | 5 | Text-to-SQL + 路由器（✅ 已提交 V9.0） | SQLite 起步 → MySQL 只改连接串 |
-| 6 | FastAPI 封装 + 前端（封装完整能力） | FastAPI / 简单网页 |
+| 6 | FastAPI 封装 + 前端（✅ 已提交 V10.0） | FastAPI / uvicorn / 简单网页 |
 | 7 | assets/logo 素材规范 | 本地目录 → 对象存储 |
 | 8 | 海报 / 文案生成 | LLM 文案 + 程序化叠加 logo |
 | 9 | 多轮记忆 + 跨轮状态（引用上轮结果） | ChatMessageHistory / 会话状态 |
@@ -1030,6 +1077,8 @@ CPU 密集的模型推理 → batch（合并样本一次算）；远程 API → 
 | `sentence-transformers` | 嵌入模型底层 | bge-small-zh 运行环境 + bge-reranker 交叉编码 | |
 | `python-dotenv` | 环境变量 | `load_dotenv()` 读 .env | |
 | `sqlite3` | SQLite 数据库（**Python 标准库**） | `SQLiteDb` 建库/查询（sql_db.py） | V9.0 无需安装 |
+| `fastapi` | Web 框架 | `app.py` 起服务（POST /ask 复用 ask()） | V10.0 新增 |
+| `uvicorn` | ASGI 服务器 | 启动 FastAPI 服务（--host 0.0.0.0 局域网可访问） | V10.0 新增 |
 
 ---
 
@@ -1080,6 +1129,8 @@ pip install -r requirements.txt
 | git push | SSL peer certificate 错误 | Windows 证书链问题 | `git config http.sslVerify false`（项目级） |
 | git push | GH001 大文件被拒（786MB PDF 超 100MB） | 大文件误入 commit 历史，pre-receive hook 拒收 | `git reset --soft HEAD~1` 撤回 → `git rm --cached` 移出跟踪（本地保留）→ .gitignore 加 `docs/*.pdf` → 重新提交推送；可重建产物（ocr_cache/、chroma_db/）同理不入库 |
 | PowerShell | commit message 中文乱码 | PS 向 native 进程传中文参数发生 UTF-8↔GBK 双重转换 | message 写入 UTF-8 文件，`git commit -F 文件` 读取（绕过传参编码） |
+| SQLite 跨线程 | Web 请求报 "SQLite objects created in a thread can only be used in that same thread" | FastAPI 同步接口跑在线程池，连接却在主线程创建（CLI 单线程无此问题） | `check_same_thread=False` + `threading.Lock` 包住 query/schema_text |
+| pip 装错环境 | 项目里 import fastapi 报 ModuleNotFoundError | pip 装进了全局 Python，项目用独立 .venv | 用 `.venv\Scripts\python -m pip install` 装进虚拟环境 |
 
 ---
 
@@ -1106,3 +1157,4 @@ pip install -r requirements.txt
 | （已提交） | MultiQuery 多路检索：LLM 拆子查询 + 每路独立精排 + rank 融合合并（手写，零新依赖） | V8.2 |
 | （已提交） | MultiQuery 跨路去重：收集候选按 page_content 去重，打分对数 100→53（规划 C 第 1 项） | V8.3 |
 | （已提交） | Text-to-SQL + 路由器：SQLite 建库导入 xlsx + LLM 路由分流 vector/sql + SQL 链降级（sql_db.py，零新依赖） | V9.0 |
+| （已提交） | FastAPI 封装 + 前端：app.py（POST /ask 复用 ask() 门面）+ templates/index.html（极简深色、移动端适配），--host 0.0.0.0 局域网访问，SQLite 线程安全修复 | V10.0 |

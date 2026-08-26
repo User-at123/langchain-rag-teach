@@ -15,6 +15,12 @@ cp .env.example .env    # 然后编辑 .env，填入你的 DeepSeek API Key
 # 3. 运行
 python main.py    # 普通问答
 python rag.py     # RAG 问答（首次运行建索引；之后增量更新：只处理新增/变更/删除的文件，V8.1）
+
+# 4. 启动 Web 服务（V10.0：极简深色前端，同一局域网手机/其他主机可访问）
+python app.py    # 直接启动（等价于下面 uvicorn 命令，端口默认 8000）
+# 或：python -m uvicorn app:app --host 0.0.0.0 --port 8000
+# 本机打开 http://127.0.0.1:8000 ；其他设备打开 http://<本机局域网IP>:8000
+# （Windows 防火墙首次弹窗请允许放行 8000 端口）
 ```
 
 ## 配置说明（.env）
@@ -112,6 +118,13 @@ V8.1 起会自动增量更新：启动时比对 `.index_state.json` 里的文件
 > vector/sql → SQL 链（问题 + schema → LLM 生成 SELECT → 执行 → 格式化）。
 > 术语翻译（"诞生时间"→"创立日期"）靠 LLM 常识零维护；只读 SELECT 白名单 +
 > 中文列名校验防注入；SQL 报错回传重写 1 次，空结果/失败自动降级向量链。
+>
+> **FastAPI Web 服务（V10.0）**：CLI 问答封装成 Web——`app.py` 起 FastAPI，
+> `POST /ask` 复用第 5 步的 `ask()` 门面（路由器自动分流 vector/sql），`GET /` 返回
+> 极简深色前端页面（`templates/index.html`，单文件内嵌 CSS/JS，移动端适配）。
+> 启动加 `--host 0.0.0.0` 后，同一局域网的手机/其他主机都能访问（本机 `127.0.0.1`，
+> 其他设备用电脑局域网 IP）。SQLite 层加了线程锁（`check_same_thread=False` + Lock），
+> Web 多线程下安全（CLI 单线程不会遇到此问题）。
 
 ## 代码结构
 
@@ -119,7 +132,9 @@ V8.1 起会自动增量更新：启动时比对 `.index_state.json` 里的文件
 | --- | --- |
 | `main.py` | 普通问答：加载配置 → 创建模型 → 定义提示词 → 组合成链 → 运行 |
 | `rag.py` | RAG 问答：多格式知识库 → 切分 → 嵌入 → Chroma 检索 → 生成；V9.0 起入口 `ask()` 带 LLM 路由器（vector/sql）分流 |
-| `sql_db.py` | Text-to-SQL 数据层（V9.0）：xlsx → SQLite 建库导入 + 只读 SELECT 执行器 + 中文列名校验 + schema 文本生成（零新增依赖） |
+| `sql_db.py` | Text-to-SQL 数据层（V9.0）：xlsx → SQLite 建库导入 + 只读 SELECT 执行器 + 中文列名校验 + schema 文本生成（零新增依赖）；V10.0 起支持跨线程（FastAPI 线程池） |
+| `app.py` | Web 服务（V10.0）：`POST /ask` 复用 `ask()` 门面 + `GET /` 前端页面 + `GET /health` 健康检查 |
+| `templates/index.html` | 极简深色前端页面（V10.0）：单文件内嵌 CSS/JS，移动端适配，fetch 调 `/ask` |
 | `knowledge_base.txt` | 单文件知识库（docs/ 为空时的回退来源） |
 | `docs/` | 多格式知识库目录（txt/md/pdf/docx/csv/xlsx） |
 | `requirements.txt` | 依赖清单 |
@@ -147,6 +162,7 @@ RAG = 检索（Retrieval）+ 增强（Augmented）+ 生成（Generation），
 | 检索 | `retriever`（V8.2 MultiQuery 多路检索：LLM 拆子查询 → 每路 BM25+向量 RRF 召回 → bge-reranker 精排 → rank 融合合并） | 解决"枚举/集合类问题"（有几个/都有谁）单路检索漏全集：一个问法只匹配一种"说法"，多路拆解覆盖不同说法后合并（实例：李云龙两任妻子 秀芹+田雨 都能召回）。每路内部仍是 BM25 关键词 + 向量语义 + RRF 融合 + reranker 精排。局限：万级全量列举/统计类问题仍靠 SQL（见 mindmap 核心概念 6） |
 | 增强 | 把 `{context}` 塞进提示词 | 让模型"带着资料"作答，并标注来源 |
 | 路由 | `ask()` 门面 + `router_chain`（V9.0） | LLM 判断问题类型：事实查询走检索链，列举/统计/聚合走 SQL 链（`sql_db.py`），SQL 失败自动降级检索链 |
+| 服务封装 | `app.py`（V10.0）：FastAPI 起服务，`POST /ask` 复用 `ask()` 门面 | 把 CLI 问答变成 Web 接口，`--host 0.0.0.0` 后局域网可访问；SQLite 跨线程用 `check_same_thread=False` + 锁保证安全 |
 
 **建议体验**：先用 `main.py` 问"星辰科技是哪年成立的"（模型不知道，会编造），
 再用 `rag.py` 问同样的问题，可以看到它基于知识库给出正确回答。

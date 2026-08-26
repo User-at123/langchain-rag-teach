@@ -318,7 +318,25 @@ LangChain 教学项目 · 可改进方向与思路笔记
        数据量变大需补"字段条件 → sql"规则）
    - 注意事项：data.db 由 xlsx 自动导入（幂等），已加 .gitignore；
      xlsx 变更后需删 data.db 重导（SQLite 层暂无增量）
-[待做] 第 6 步：FastAPI 封装 + 简单前端页面（封装完整能力，含 SQL 路由）
+[已完成] 第 6 步：FastAPI 封装 + 极简深色前端（V10.0，2026-08-26 实施并验证）
+   - 后端 app.py：POST /ask 复用 ask() 门面（零逻辑重复，门面模式价值兑现）；
+     GET / 返回前端页面；GET /health 健康检查（局域网设备先探活）
+   - 前端 templates/index.html：单文件内嵌 CSS/JS，GitHub Dark 极简深色风格，
+     viewport 移动端适配，Enter 发送 + fetch 调 /ask 异步渲染气泡
+   - 生命周期：from rag import ask 在服务启动时初始化一次（加载文档/建索引/建 SQLite），
+     之后每个请求复用——RAG 重活只做一次
+   - 局域网访问：python -m uvicorn app:app --host 0.0.0.0 --port 8000
+     （本机 127.0.0.1；其他设备 http://<电脑局域网IP>:8000）
+   - 踩坑（教学价值高）：FastAPI 同步接口跑在【线程池】，SQLite 连接在主线程创建，
+     默认 check_same_thread=True → 请求报 "SQLite objects created in a thread can only
+     be used in that same thread"（CLI 单线程没这问题，Web 多线程才暴露）
+     → 修：sqlite3.connect(check_same_thread=False) + threading.Lock 包住 query/schema_text
+   - 另：pip 需装进 .venv（项目 venv 独立于全局 Python，装错环境 import 不到）
+   - 验证：冒烟脚本起服务——health 200 / 首页 200 / 空问题 400 /
+     正常问题 200 且 SQL 链返回 3 行结果（金融/零售/教育）✅
+   - 新增依赖：fastapi、uvicorn（requirements.txt 已加）
+   - 注意事项：Windows 防火墙首次放行 8000 端口，其他设备才能访问；
+     前端是"一接口一页面"最小形态，第 9/10 步接入时扩展 /ask 即可
 [待做] 第 7 步：建立 assets/logo 素材目录规范          （为海报生成做准备）
 [待做] 第 8 步：海报/文案生成模块（先做文案，再做图片；logo 用程序化叠加）
 [待做] 第 9 步：多轮记忆 + 跨轮状态（支撑"引用前面结果的推理"）

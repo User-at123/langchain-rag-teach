@@ -20,3 +20,6 @@ PyMuPDF>=1.24.0
 rapidocr-onnxruntime>=1.3.0
 Pillow>=10.0.0
 tqdm>=4.66.0  # OCR 进度条（当前页/总页数、速度、预计剩余时间）
+# —— V10.0 FastAPI 封装（第 6 步） ——
+fastapi>=0.110.0
+uvicorn>=0.29.0
