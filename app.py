@@ -15,6 +15,7 @@
 """
 
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -22,11 +23,19 @@ from pydantic import BaseModel
 
 import uvicorn  # 供 python app.py 直接启动
 
-# 启动时一次性初始化（加载索引、建 SQLite 等）；
-# rag.py 顶层无 input()/sys.exit 等交互副作用，可安全 import
-from rag import ask
+# rag.py 顶层零副作用（init() 化后 import 不建索引）；启动时在 lifespan 中显式 init()
+from rag import ask, init
 
-app = FastAPI(title="RAG 知识库问答", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启动时一次性初始化（加载索引、建 SQLite 等）；uvicorn 启动时自动执行。
+    测试用 TestClient 不进入 lifespan 时不会初始化，可测 /health 等无依赖接口。"""
+    init()
+    yield
+
+
+app = FastAPI(title="RAG 知识库问答", version="1.0.0", lifespan=lifespan)
 
 
 class AskRequest(BaseModel):

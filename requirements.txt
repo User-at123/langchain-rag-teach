@@ -3,19 +3,17 @@ langchain-openai>=0.2.0
 langchain-text-splitters>=0.3.0
 langchain-huggingface>=0.1.0
 langchain-chroma>=0.1.0
-langchain-community>=0.3.0
 rank-bm25>=0.2.2
 jieba>=0.42.1
 # 注：官方 EnsembleRetriever / CrossEncoderReranker 在独立包 langchain-retrievers 中，
 #     但该包在国内镜像（清华/阿里）未同步、PyPI 无法安装，本项目改为手写实现
 #     （见 rag.py 中的 RRFRetriever / RerankerRetriever，教学价值更高）
-pypdf>=5.0.0
-docx2txt>=0.8
+# V10.1 起：langchain-community / pypdf / docx2txt 已移除（加载器全部手写，见 rag.py）
 openpyxl>=3.0.0
 sentence-transformers>=3.0.0
 python-dotenv>=1.0.0
 # —— V8.0 OCR 扫描件支持 ——
-# PyMuPDF：把扫描 PDF 页渲染成位图；rapidocr-onnxruntime：离线中文 OCR（模型内置于包内，不联网）
+# PyMuPDF：把扫描 PDF 页渲染成位图 + 提取文字层；rapidocr-onnxruntime：离线中文 OCR（模型内置于包内，不联网）
 PyMuPDF>=1.24.0
 rapidocr-onnxruntime>=1.3.0
 Pillow>=10.0.0
@@ -23,3 +21,6 @@ tqdm>=4.66.0  # OCR 进度条（当前页/总页数、速度、预计剩余时�
 # —— V10.0 FastAPI 封装（第 6 步） ——
 fastapi>=0.110.0
 uvicorn>=0.29.0
+# —— V10.1 测试（pytest + 规划 A） ——
+pytest>=8.0
+httpx>=0.27.0  # fastapi.testclient 依赖（TestClient 用）

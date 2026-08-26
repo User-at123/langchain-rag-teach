@@ -14,13 +14,16 @@ cp .env.example .env    # 然后编辑 .env，填入你的 DeepSeek API Key
 
 # 3. 运行
 python main.py    # 普通问答
-python rag.py     # RAG 问答（首次运行建索引；之后增量更新：只处理新增/变更/删除的文件，V8.1）
+python rag.py     # RAG 问答（首次运行建索引；之后增量更新：只处理新增/变更/删除的文件，V8.1；入口显式 init()，V10.1）
 
 # 4. 启动 Web 服务（V10.0：极简深色前端，同一局域网手机/其他主机可访问）
-python app.py    # 直接启动（等价于下面 uvicorn 命令，端口默认 8000）
+python app.py    # 直接启动（等价于下面 uvicorn 命令，端口默认 8000；lifespan 自动 init，V10.1）
 # 或：python -m uvicorn app:app --host 0.0.0.0 --port 8000
 # 本机打开 http://127.0.0.1:8000 ；其他设备打开 http://<本机局域网IP>:8000
 # （Windows 防火墙首次弹窗请允许放行 8000 端口）
+
+# 5. 运行回归测试（V10.1：pytest，tests/ 24 个用例，无需真实 API、不建索引）
+python -m pytest
 ```
 
 ## 配置说明（.env）
@@ -66,7 +69,7 @@ V8.1 起会自动增量更新：启动时比对 `.index_state.json` 里的文件
 
 **4. 放了 PDF 进去，但检索 PDF 内容为空**
 
-大概率是**扫描版 PDF**（每页是图片、没有文字层），`PyPDFLoader` 提取出来是空文本，
+大概率是**扫描版 PDF**（每页是图片、没有文字层），文字层提取出来是空文本，
 程序不报错但检索结果为空。V8.0 起 `rag.py` 会自动检测并走 OCR（离线中文识别）：
 - 文字层够的页直接用；扫描页自动 OCR（首次碰到会加载 OCR 模型，稍慢）
 - OCR 全程有进度条（tqdm）：实时显示当前页/总页数、每页耗时、预计剩余时间，
@@ -82,7 +85,7 @@ V8.1 起会自动增量更新：启动时比对 `.index_state.json` 里的文件
 | --- | --- |
 | `.txt` | 直接放入即可 |
 | `.md` | 直接放入即可；按标题层级切分（章节不拆散） |
-| `.pdf` | 直接放入即可。文字版直接提取；扫描版（每页是图片）自动走 OCR 识别（V8.0：PyMuPDF 渲染 + RapidOCR 离线识别） |
+| `.pdf` | 直接放入即可。文字版直接提取（V10.1 起手写实现：PyMuPDF 逐页 `get_text()`）；扫描版（每页是图片）自动走 OCR 识别（V8.0：PyMuPDF 渲染 + RapidOCR 离线识别） |
 | `.docx` | Word 文档，直接放入即可 |
 | `.csv` | 直接放入即可；按行切分，一行一条记录 |
 | `.xlsx` | Excel，直接放入即可；按行切分，表头字段名会拼进每一行数据（2.6 步起） |
@@ -125,18 +128,27 @@ V8.1 起会自动增量更新：启动时比对 `.index_state.json` 里的文件
 > 启动加 `--host 0.0.0.0` 后，同一局域网的手机/其他主机都能访问（本机 `127.0.0.1`，
 > 其他设备用电脑局域网 IP）。SQLite 层加了线程锁（`check_same_thread=False` + Lock），
 > Web 多线程下安全（CLI 单线程不会遇到此问题）。
+>
+> **依赖解耦 + 回归测试（V10.1）**：加载器与 BM25 检索器全部手写（替代已官宣
+> sunset 的 langchain-community），`langchain-community` / `pypdf` / `docx2txt` 依赖
+> 已移除。`rag.py` 顶层重活包进 `init()`（import 零副作用，测试能秒级跑），
+> `app.py` 在 lifespan 中调用 `init()`；`ask()` 支持依赖注入
+> （`llm`/`retriever`/`db`），测试传 mock 免费验证路由与降级链路。
+> 回归测试：`python -m pytest`（tests/ 24 个用例，无需真实 API、不建索引）。
 
 ## 代码结构
 
 | 文件 | 作用 |
 | --- | --- |
 | `main.py` | 普通问答：加载配置 → 创建模型 → 定义提示词 → 组合成链 → 运行 |
-| `rag.py` | RAG 问答：多格式知识库 → 切分 → 嵌入 → Chroma 检索 → 生成；V9.0 起入口 `ask()` 带 LLM 路由器（vector/sql）分流 |
+| `rag.py` | RAG 问答：多格式知识库 → 切分 → 嵌入 → Chroma 检索 → 生成；V9.0 起入口 `ask()` 带 LLM 路由器（vector/sql）分流；V10.1 起加载器/BM25 全部手写（去掉 langchain-community）、顶层重活包进 `init()`、`ask()` 支持依赖注入 |
 | `sql_db.py` | Text-to-SQL 数据层（V9.0）：xlsx → SQLite 建库导入 + 只读 SELECT 执行器 + 中文列名校验 + schema 文本生成（零新增依赖）；V10.0 起支持跨线程（FastAPI 线程池） |
 | `app.py` | Web 服务（V10.0）：`POST /ask` 复用 `ask()` 门面 + `GET /` 前端页面 + `GET /health` 健康检查 |
 | `templates/index.html` | 极简深色前端页面（V10.0）：单文件内嵌 CSS/JS，移动端适配，fetch 调 `/ask` |
 | `knowledge_base.txt` | 单文件知识库（docs/ 为空时的回退来源） |
 | `docs/` | 多格式知识库目录（txt/md/pdf/docx/csv/xlsx） |
+| `tests/` | pytest 回归测试（V10.1）：sql_db 校验 / rag 纯函数 / app 接口 / ask mock 链路，共 24 个用例，无需真实 API |
+| `pytest.ini` | pytest 配置（V10.1）：指定 tests/ 目录 + 项目根可导入 |
 | `requirements.txt` | 依赖清单 |
 | `.env.example` | 环境变量模板（复制为 `.env` 后填写） |
 

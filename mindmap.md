@@ -111,6 +111,13 @@ LangChain 教学项目
 │   │          sqlite3.connect(check_same_thread=False) + threading.Lock 兜底
 │   └── 新增依赖：fastapi / uvicorn；--host 0.0.0.0 支持局域网访问
 │
+├── V10.1 依赖解耦 + pytest（规划 A，已提交）
+│   ├── 顶层重活包进 init()：import rag 零副作用（pytest 能跑的前提）
+│   ├── 手写 5 个加载器/检索器：TextLoader / PyPDFLoader(pymupdf) /
+│   │   Docx2txtLoader(zipfile) / CSVLoader(csv) / BM25Retriever(rank_bm25+jieba)
+│   ├── ask() 依赖注入：ask(question, *, llm=None, retriever=None, db=None)
+│   └── pytest 24 用例：sql_db 校验 / rag 纯函数 / app 接口 / mock 链路（免费不 flaky）
+│
 └── V8+ 未来规划（见 improvements.txt）
     ├── 3   已提交（V7.9）：BM25 混合检索 + bge-reranker 重排序
     ├── 3.5 已提交（V8.0）：扫描件 PDF 自动 OCR（PyMuPDF + RapidOCR）
@@ -121,7 +128,7 @@ LangChain 教学项目
     ├── 8   海报 / 文案生成（logo 程序化叠加）
     ├── 9   多轮记忆 + 跨轮状态（路由三路：vector / sql / memory）
     ├── 10  Agent 工具化（query_sql / retrieve_vector / read_memory 自主编排）
-    ├── 11  依赖解耦重构（方案 A，待实施）：去掉 langchain-community，手写薄封装
+    ├── 11  已提交（V10.1）：依赖解耦重构（规划 A）——去掉 langchain-community，手写 5 个加载器/检索器
     └── 12  已提交（V8.1）：增量索引——.index_state.json + 文件级差异，免全量重建
 ```
 
@@ -636,6 +643,51 @@ LOADER_MAP = {
 
 ---
 
+### V10.1 依赖解耦 + pytest（规划 A，已提交）
+
+**改动内容**
+- rag.py 顶层重构：所有重资源（嵌入模型/建索引/检索器/LLM/SQLite/链）从
+  "import 即执行"改为 `init()` 函数内创建（幂等）；`import rag` 零副作用
+  ——这是 pytest 能跑的前提（测试 import 只加载轻量定义）
+- 手写 5 个加载器/检索器（规划 A 主体，替代已停维护的 langchain-community）：
+  1. `load_text`：open + encoding 读全文，1 个 Document（metadata["source"] 完整路径）
+  2. `load_pdf`：PyMuPDF 逐页 `get_text()`，保持"每页一个 Document + source + page"
+     （下方 OCR 判定依赖此结构，扫描页分支零改动）
+  3. `load_docx`：zipfile 解 word/document.xml，按 w:p 提取 w:t（整文档一个 Document）
+  4. `load_csv`：csv.DictReader 逐行 → "列名: 值" 换行连接 + source 带行号
+  5. `BM25Retriever`：rank_bm25.BM25Okapi + jieba 分词，继承 BaseRetriever
+     （LCEL 管道 `|` 与 RRFRetriever.retrievers 按 BaseRetriever 协议调用）
+- `ask()` 依赖注入：`ask(question, *, llm=None, retriever=None, db=None)`——
+  测试传 mock 时重建链路（不污染全局），默认 None 走 init() 全局对象
+- app.py 生命周期：`lifespan` 里调 `init()`（uvicorn 启动时初始化一次；
+  TestClient 不进入 lifespan 时不初始化 → /health 等无依赖接口秒级测试）
+
+**踩坑记录（重点）**
+- 改造时漏了 `retriever` 顶层占位 → `init()` 里 `global retriever` NameError
+  （全局占位必须与 init() 的 global 声明一一对应，先跑一次 init 冒烟再写测试）
+- FakeRetriever 第一版是普通对象 → `lambda | retriever` 报 TypeError
+  （LCEL 管道靠 Runnable.__ror__ 组合，必须继承 BaseRetriever）
+- pydantic v2 模型不能位置参数实例化 → `FakeRetriever(docs=[...])` 必须字段赋值
+
+**新增依赖**
+- 新增 `pytest`、`httpx`（fastapi.testclient 依赖）；**移除** langchain-community /
+  pypdf / docx2txt（全部由手写实现取代）
+
+**验证结果**
+- pytest 24 用例全绿（约 7s）：sql_db 三道校验 / rag 纯函数（指纹、索引状态、
+  OCR 缓存、格式化）/ app 接口（health、空问题 400）/ ask mock 链路（SQL 路径
+  真实执行临时库、vector 路径、SQL 失败→重写→降级、空结果→降级、注入不污染全局）
+- 真实链路冒烟：切分 2541 片段与 V10.0 完全一致（手写加载器行为对齐，增量索引不
+  错位）；BM25 从向量库取回重建正常；SQL 路由问答正常；Web lifespan 启动正常
+
+**注意事项**
+- 运行方式不变：`python app.py`（lifespan 自动 init）/ `python rag.py`（CLI 显式 init）
+- 跑测试：`.venv\Scripts\python -m pytest`（或 pytest -q）
+- 移除依赖后若环境仍能 import langchain_community（历史残留），不影响运行，
+  下次全新部署按 requirements.txt 安装即不含这些包
+
+---
+
 ### V8+ 未来规划（详见 improvements.txt）
 
 | 步骤 | 内容 | 关键工具 |
@@ -652,7 +704,7 @@ LOADER_MAP = {
 | 11 | 依赖解耦重构（方案 A，已记录待实施） | 手写 5 个加载器 + BM25Retriever，去掉 langchain-community |
 | 12 | 增量索引（✅ 已提交 V8.1） | .index_state.json + Chroma 按 source 增删，免全量重建 |
 
-**规划 A：依赖解耦重构（已记录，待实施；2026-08 记录，今日不改代码）**
+**规划 A：依赖解耦重构（✅ 已实施 V10.1，2026-08-26；详见上方 V10.1 详解）**
 - 动机：`langchain-community` 已官宣 sunset（rag.py 每次运行都有 DeprecationWarning）；
   `BM25Retriever` 参数名已随版本变过（preprocess_func vs tokenizer）——薄封装最易踩版本坑
 - 决策：**LCEL 管道不重写**（保留 `|` 声明式写法，见核心概念 8），只解耦"依赖不稳定的具体实现"
@@ -1064,12 +1116,9 @@ CPU 密集的模型推理 → batch（合并样本一次算）；远程 API → 
 | `langchain-text-splitters` | 文本切分 | `RecursiveCharacterTextSplitter` | |
 | `langchain-huggingface` | 本地嵌入 | `HuggingFaceEmbeddings` | DeepSeek 无 Embedding API |
 | `langchain-chroma` | 向量库 | `Chroma` 持久化 | 索引存 ./chroma_db |
-| `langchain-community` | 文档加载器 | Text/PyPDF/Docx2txt/CSVLoader | 0.4.2 起移除 loader_map！ |
-| `pypdf` | PDF 解析 | `PyPDFLoader` | V6 新增 |
-| `docx2txt` | Word 解析 | `Docx2txtLoader` | V6 新增 |
 | `openpyxl` | Excel 解析 | `load_xlsx`（自写函数） | V7.5 新增 |
 | `rank-bm25` | BM25 关键词检索算法 | `BM25Retriever` 底层 | V7.9 新增 |
-| `PyMuPDF` | PDF 页渲染成位图 | `load_pdf` OCR 分支（扫描件） | V8.0 新增 |
+| `PyMuPDF` | PDF 页渲染成位图 + 提取文字层 | `load_pdf` 手写提取 + OCR 分支（扫描件） | V8.0 新增（V10.1 起兼文字提取） |
 | `rapidocr-onnxruntime` | 离线中文 OCR（包内置模型） | 扫描页文字识别 | V8.0 新增 |
 | `Pillow` | 图像处理（位图 → numpy 数组） | OCR 前处理 | V8.0 新增 |
 | `tqdm` | 进度条 | OCR 循环进度可视化（页数/速度/ETA） | V8.0 新增 |
@@ -1079,6 +1128,11 @@ CPU 密集的模型推理 → batch（合并样本一次算）；远程 API → 
 | `sqlite3` | SQLite 数据库（**Python 标准库**） | `SQLiteDb` 建库/查询（sql_db.py） | V9.0 无需安装 |
 | `fastapi` | Web 框架 | `app.py` 起服务（POST /ask 复用 ask()） | V10.0 新增 |
 | `uvicorn` | ASGI 服务器 | 启动 FastAPI 服务（--host 0.0.0.0 局域网可访问） | V10.0 新增 |
+| `pytest` | 测试框架 | tests/ 24 个回归用例（sql_db/rag 纯函数/app 接口/mock 链路） | V10.1 新增 |
+| `httpx` | HTTP 客户端 | fastapi.testclient（TestClient）依赖 | V10.1 新增 |
+
+> V10.1 移除：`langchain-community`（已官宣 sunset）/ `pypdf` / `docx2txt`——
+> 加载器与 BM25 全部手写（见 V10.1 详解），对应 `rag.py` 顶部"依赖说明"注释
 
 ---
 

@@ -24,14 +24,9 @@ if os.getenv("USE_INSECURE_SSL") == "1":
 
 from typing import Any, List
 
+from rank_bm25 import BM25Okapi  # 手写 BM25 检索器用（替代已停维护的 langchain-community）
+
 from langchain_chroma import Chroma
-from langchain_community.document_loaders import (
-    CSVLoader,
-    Docx2txtLoader,
-    PyPDFLoader,
-    TextLoader,
-)
-from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -55,8 +50,11 @@ DOCS_DIR = os.getenv("DOCS_DIR", "./docs")
 # 文本类必须指定 encoding="utf-8"：Windows 默认 GBK 打开，知识库是 UTF-8，
 # 不指定会报 UnicodeDecodeError
 def load_text(path, encoding):
-    """加载 .txt / .md：LangChain 的 TextLoader，读入整个文件。"""
-    return TextLoader(path, encoding=encoding).load()
+    """加载 .txt / .md：直接读入整个文件（手写实现，替代已停维护的 TextLoader）。
+    metadata 带 "source" 完整路径——增量索引按 source 删除旧片段。"""
+    with open(path, encoding=encoding) as f:
+        content = f.read()
+    return [Document(page_content=content, metadata={"source": path})]
 
 
 # ===== PDF 加载（含扫描件自动 OCR）=====
@@ -93,8 +91,19 @@ def _read_ocr_cache(cache_path):
 
 
 def load_pdf(path):
-    """加载 .pdf：文字版直接提取；扫描页（提取文字过少）用 PyMuPDF 渲染 + RapidOCR 离线识别。"""
-    docs = PyPDFLoader(path).load()
+    """加载 .pdf：文字版直接提取；扫描页（提取文字过少）用 PyMuPDF 渲染 + RapidOCR 离线识别。
+    手写文字提取（替代已停维护的 PyPDFLoader）：PyMuPDF 逐页 get_text()，
+    输出格式保持"每页一个 Document，metadata 带 source + page"（下方 OCR 判定依赖此结构）。"""
+    import pymupdf as fitz
+
+    pdf = fitz.open(path)
+    docs = []
+    for i in range(len(pdf)):
+        docs.append(Document(
+            page_content=pdf[i].get_text(),
+            metadata={"source": path, "page": i},
+        ))
+    pdf.close()
     # 找出"扫描页"（提取文字过少）
     ocr_idx = [i for i, d in enumerate(docs)
                if len(d.page_content.strip()) < OCR_MIN_TEXT_LEN]
@@ -149,13 +158,41 @@ def load_pdf(path):
 
 
 def load_docx(path):
-    """加载 .docx：Docx2txtLoader 提取 Word 中的文本（二进制解析，无编码问题）。"""
-    return Docx2txtLoader(path).load()
+    """加载 .docx：zipfile 解 word/document.xml，按 w:p 段落提取 w:t 文本（手写实现）。
+    行为与 Docx2txtLoader 一致：整个文档一个 Document，source 带路径。
+    表格内的段落也提取（docx 表格内容同样存在于 w:p 中，与原实现行为一致）。"""
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with zipfile.ZipFile(path) as z:
+        xml_content = z.read("word/document.xml")
+    root = ET.fromstring(xml_content)
+    parts = []
+    for p in root.iter(f"{NS}p"):
+        text = "".join(t.text or "" for t in p.iter(f"{NS}t"))
+        parts.append(text)
+    return [Document(page_content="\n".join(parts), metadata={"source": path})]
 
 
 def load_csv(path, encoding):
-    """加载 .csv：CSVLoader 默认按行切，每行一个 Document（表格语义在"行"）。"""
-    return CSVLoader(path, encoding=encoding).load()
+    """加载 .csv：每行一个 Document，内容为 "列名: 值" 换行连接（与 LangChain CSVLoader 一致）。
+    手写实现：csv.DictReader 读取，空字段/空表头容错（原实现遇 None 值会崩溃）。"""
+    import csv
+
+    docs = []
+    with open(path, encoding=encoding, newline="") as f:
+        for i, row in enumerate(csv.DictReader(f)):
+            content = "\n".join(
+                f"{k.strip()}: {v.strip()}"
+                for k, v in row.items()
+                if k is not None and k.strip() and v is not None
+            )
+            docs.append(Document(
+                page_content=content,
+                metadata={"source": f"{path}:{i + 2}"},  # 行号从 2 开始（第 1 行是表头）
+            ))
+    return docs
 
 
 def load_xlsx(path):
@@ -269,9 +306,10 @@ def split_documents_by_format(documents):
 # ========== 3. 嵌入 + 存储（Chroma 持久化 + 增量索引） ==========
 # 片段转向量存 ./chroma_db（首次运行自动下载本地模型，约 100MB）
 # 注意：DeepSeek 无 Embedding API，故用本地开源模型
-embeddings = HuggingFaceEmbeddings(
-    model_name=os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5"),
-)
+# 顶层只留 None 占位，真实对象在 init() 中创建——避免 import 时下载模型/建索引
+# （这是 pytest 能跑的前提：测试 import rag 只加载轻量定义，不碰重资源）
+embeddings = None
+vector_store = None
 
 CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma_db")
 
@@ -318,26 +356,28 @@ def save_index_state(state):
 
 
 # ===== 三向分支：首次全量 / 旧索引校准 / 增量比对 =====
-scan = scan_docs_files()
-
-if not os.path.exists(CHROMA_DIR):
-    # 分支 1：首次运行——全量加载 + 切分 + 嵌入
-    print("首次运行：加载全部文档 ...")
-    documents = load_documents()
-    print(f"加载了 {len(documents)} 个文档")
-    chunks = split_documents_by_format(documents)
-    print(f"切分成 {len(chunks)} 个片段")
-    print("创建向量索引并保存到磁盘 ...")
-    vector_store = Chroma.from_documents(
-        chunks,
-        embedding=embeddings,
-        persist_directory=CHROMA_DIR,
-    )
-    save_index_state(scan)  # 全部文件记为"已入库"
-    print(f"  已记录 {len(scan)} 个文件的指纹（{INDEX_STATE_FILE}），下次启动开始走增量")
-else:
+def _build_vector_store():
+    """构建或加载向量库（首次全量嵌入，之后增量比对），返回 Chroma 实例。
+    逻辑与原顶层代码逐行一致，仅把对全局 vector_store 的赋值改为局部 vs。"""
+    scan = scan_docs_files()
+    if not os.path.exists(CHROMA_DIR):
+        # 分支 1：首次运行——全量加载 + 切分 + 嵌入
+        print("首次运行：加载全部文档 ...")
+        documents = load_documents()
+        print(f"加载了 {len(documents)} 个文档")
+        chunks = split_documents_by_format(documents)
+        print(f"切分成 {len(chunks)} 个片段")
+        print("创建向量索引并保存到磁盘 ...")
+        vs = Chroma.from_documents(
+            chunks,
+            embedding=embeddings,
+            persist_directory=CHROMA_DIR,
+        )
+        save_index_state(scan)  # 全部文件记为"已入库"
+        print(f"  已记录 {len(scan)} 个文件的指纹（{INDEX_STATE_FILE}），下次启动开始走增量")
+        return vs
     # 索引已存在：直接加载，不重新嵌入
-    vector_store = Chroma(
+    vs = Chroma(
         embedding_function=embeddings,
         persist_directory=CHROMA_DIR,
     )
@@ -356,7 +396,7 @@ else:
         print(f"增量比对：新增 {len(added)} 变更 {len(changed)} 删除 {len(removed)} 跳过 {len(untouched)}")
         for p in removed:
             print(f"  [删除] {p}")
-            vector_store.delete(where={"source": p})
+            vs.delete(where={"source": p})
         for p in added + changed:
             action = "新增" if p in added else "变更"
             print(f"  [{action}] {p}（单文件处理，其余跳过）")
@@ -364,25 +404,65 @@ else:
             new_chunks = split_documents_by_format(docs)
             if p in changed:
                 # 变更：先按 source 删旧片段，再入库新的（避免残留重复）
-                vector_store.delete(where={"source": p})
-            vector_store.add_documents(new_chunks)
+                vs.delete(where={"source": p})
+            vs.add_documents(new_chunks)
         save_index_state(scan)  # 更新基线
         print("  指纹基线已更新")
+    return vs
 
 # ========== 4. 创建检索器（混合检索 + 重排序） ==========
 # 两路召回（BM25 关键词 + 向量语义）取并集 → 广召回 Top 50 → bge-reranker 精排 → 留 top_n 条
 # 注：检索参数变化无需重建 chroma_db（只影响查询，不影响索引内容）
 
 # ===== 3.5 模型（提前定义：MultiQuery 拆子查询与主问答链共用） =====
-llm = ChatOpenAI(
-    base_url=os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1"),
-    model=os.getenv("LLM_MODEL", "deepseek-chat"),
-    temperature=0.3,
-)
+# 顶层占位，init() 中创建（ChatOpenAI 惰性发请求，但仍统一放 init 保持"import 零副作用"）
+llm = None
 
-# ===== 手写工具类：RRF 融合 + Reranker 精排 =====
+# ===== 手写工具类：BM25 + RRF 融合 + Reranker 精排 =====
 # 官方实现在独立包 langchain-retrievers（国内镜像未同步无法安装），故手写；
+# BM25 原 langchain-community 版已停维护，一并改为 rank_bm25 + jieba 手写；
 # 依赖只需 rank_bm25 + jieba（均已安装）
+
+
+class BM25Retriever(BaseRetriever):
+    """BM25 关键词检索（手写实现，替代已停维护的 langchain-community BM25Retriever）。
+
+    必须继承 BaseRetriever：LCEL 管道 `| retriever` 和 RRFRetriever.retrievers
+    都按 BaseRetriever 协议调用，不继承则不兼容。
+    中文分词固定走 jieba（rank_bm25 默认按空格分词，中文整句会被当成一个 token）。"""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    documents: List[str] = Field(description="语料文本列表")
+    metadatas: List[dict] = Field(default_factory=list, description="与 documents 对应的元数据")
+    k: int = Field(default=50, description="返回条数")
+
+    _bm25: Any = PrivateAttr(default=None)
+
+    def _init_bm25(self):
+        """懒初始化：jieba 分词后建 BM25 索引（与构建时刻分离，import 零开销）。"""
+        self._bm25 = BM25Okapi([list(jieba.cut(t)) for t in self.documents])
+
+    def _get_relevant_documents(self, query: str, *, run_manager: Any = None):
+        if self._bm25 is None:
+            self._init_bm25()
+        tokens = list(jieba.cut(query))
+        if not tokens:
+            return []
+        scores = self._bm25.get_scores(tokens)
+        top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[: self.k]
+        return [
+            Document(
+                page_content=self.documents[i],
+                metadata=self.metadatas[i] if i < len(self.metadatas) else {},
+            )
+            for i in top_idx
+        ]
+
+    @classmethod
+    def from_texts(cls, texts, k=50, preprocess_func=None, metadatas=None):
+        """兼容原 LangChain 版调用签名（preprocess_func 保留参数但不使用，分词内部固定 jieba）。"""
+        return cls(documents=list(texts), k=k, metadatas=list(metadatas or []))
 
 
 class RRFRetriever(BaseRetriever):
@@ -559,47 +639,51 @@ class MultiQueryRetriever(BaseRetriever):
         return [d for d, _ in ranked[: self.top_n]]
 
 
-# 4.1 BM25 关键词检索（无状态：每次启动从向量库全量取回文本现场重建）
-#     坑：rank_bm25 默认按空格分词，中文整句会被当成一个 token，BM25 失效；
-#         必须传 jieba 分词器（preprocess_func；新版独立包叫 tokenizer）
-_all_docs = vector_store.get(include=["documents", "metadatas"])
-bm25_texts = _all_docs["documents"]
-bm25_metadatas = _all_docs["metadatas"]
-print(f"BM25 从向量库取回 {len(bm25_texts)} 个片段重建（无状态索引）")
-bm25_retriever = BM25Retriever.from_texts(
-    bm25_texts,
-    k=50,
-    preprocess_func=lambda t: list(jieba.cut(t)),
-    metadatas=bm25_metadatas,  # 保留 source 等元数据，方便追溯
-)
+# 4.x 检索器构建（init() 中调用；依赖 vector_store 与 llm）
+# 注：bm25/vector/ensemble/reranker 检索器仅在构建时组合使用，无需模块级暴露
+def _build_retrievers(vs, llm_obj):
+    """基于向量库与 LLM 构建混合检索器，返回最终 MultiQueryRetriever（进管道的那一个）。"""
+    # 4.1 BM25 关键词检索（无状态：每次启动从向量库全量取回文本现场重建）
+    #     坑：rank_bm25 默认按空格分词，中文整句会被当成一个 token，BM25 失效；
+    #         必须传 jieba 分词器（preprocess_func；新版独立包叫 tokenizer）
+    _all_docs = vs.get(include=["documents", "metadatas"])
+    bm25_texts = _all_docs["documents"]
+    bm25_metadatas = _all_docs["metadatas"]
+    print(f"BM25 从向量库取回 {len(bm25_texts)} 个片段重建（无状态索引）")
+    bm25_retriever = BM25Retriever.from_texts(
+        bm25_texts,
+        k=50,
+        preprocess_func=lambda t: list(jieba.cut(t)),
+        metadatas=bm25_metadatas,  # 保留 source 等元数据，方便追溯
+    )
 
-# 4.2 向量语义检索（Chroma，召回放宽到 50，交由 reranker 精排）
-vector_retriever = vector_store.as_retriever(search_kwargs={"k": 50})
+    # 4.2 向量语义检索（Chroma，召回放宽到 50，交由 reranker 精排）
+    vector_retriever = vs.as_retriever(search_kwargs={"k": 50})
 
-# 4.3 融合两路召回（手写 RRF）
-ensemble_retriever = RRFRetriever(
-    retrievers=[bm25_retriever, vector_retriever],
-)
+    # 4.3 融合两路召回（手写 RRF）
+    ensemble_retriever = RRFRetriever(
+        retrievers=[bm25_retriever, vector_retriever],
+    )
 
-# 4.4 重排序（交叉编码器：候选逐条算相关度，精排后只留 top_n 条）
-# 注意：以下实例未进当前管道（管道用 4.5 的 MultiQuery，内部自带批量精排），
-#       保留作单路对比演示；删掉不影响运行
-reranker_retriever = RerankerRetriever(
-    base_retriever=ensemble_retriever,
-    model_name=os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base"),
-    top_n=6,
-)
+    # 4.4 重排序（交叉编码器：候选逐条算相关度，精排后只留 top_n 条）
+    # 注意：以下实例未进当前管道（管道用 4.5 的 MultiQuery，内部自带批量精排），
+    #       保留作单路对比演示；删掉不影响运行
+    reranker_retriever = RerankerRetriever(
+        base_retriever=ensemble_retriever,
+        model_name=os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base"),
+        top_n=6,
+    )
 
-# 4.5 MultiQuery 多路检索：LLM 拆子查询覆盖"不同说法"→ 每路独立召回精排 → rank 融合。
-#     解决"枚举/聚合"类问题（几个/都有谁）单路检索漏全集。
-#     管道 `| retriever |` 不用改，换的只是 retriever 实现。
-retriever = MultiQueryRetriever(
-    base_retriever=ensemble_retriever,
-    llm=llm,
-    sub_query_count=5,
-    per_query_top_n=3,
-    top_n=6,
-)
+    # 4.5 MultiQuery 多路检索：LLM 拆子查询覆盖"不同说法"→ 每路独立召回精排 → rank 融合。
+    #     解决"枚举/聚合"类问题（几个/都有谁）单路检索漏全集。
+    #     管道 `| retriever |` 不用改，换的只是 retriever 实现。
+    return MultiQueryRetriever(
+        base_retriever=ensemble_retriever,
+        llm=llm_obj,
+        sub_query_count=5,
+        per_query_top_n=3,
+        top_n=6,
+    )
 
 # ========== 5. 提示词 ==========
 # 检索结果作为"参考资料"进提示词，让模型据此回答
@@ -621,20 +705,28 @@ def format_docs(docs):
     return "\n\n".join(parts)
 
 # 并行分支：context = 检索 question 并格式化成文本；question = 原样透传
-chain = (
-    {
-        "context": (lambda x: x["question"]) | retriever | format_docs,
-        "question": lambda x: x["question"],
-    }
-    | prompt
-    | llm
-)
+def build_qa_chain(llm_obj, retriever_obj):
+    """构建主问答链：检索 question → 格式化 context → 提示词 → LLM。
+    独立成函数，便于 init() 构建全局 chain、测试时注入 mock llm/retriever 重建。"""
+    return (
+        {
+            "context": (lambda x: x["question"]) | retriever_obj | format_docs,
+            "question": lambda x: x["question"],
+        }
+        | prompt
+        | llm_obj
+    )
+
+
+chain = None  # init() 中构建
+retriever = None  # init() 中构建（MultiQueryRetriever 实例）
 
 # ========== 6.5 Text-to-SQL + 路由器 ==========
 # 链路：路由器判断类型 → 事实查询走向量链（chain）→ 列举/统计走 SQL 链（sql_db.py）；
 #       SQL 执行失败 → 报错回传 LLM 重写 1 次；空结果/仍失败 → 降级向量链
 # 术语翻译靠 LLM 常识（schema 只给真实表头+样例），捏造列名由 sql_db 列名校验拦截
-db = SQLiteDb()
+db = None          # init() 中创建（SQLiteDb 实例）
+router_chain = None  # init() 中构建（router_prompt | llm | StrOutputParser）
 
 # 6.5.1 路由器：判断问题走 vector（文档检索）还是 sql（数据库查询）
 router_prompt = ChatPromptTemplate.from_messages([
@@ -651,7 +743,8 @@ router_prompt = ChatPromptTemplate.from_messages([
      "4. 不确定时默认 vector（文档检索覆盖面更广，SQL 只覆盖表格数据）"),
     ("human", "{question}"),
 ])
-router_chain = router_prompt | llm | StrOutputParser()
+# router_chain 在 init() 中构建（依赖 llm）：
+#   router_chain = router_prompt | llm | StrOutputParser()
 
 # 6.5.2 Text-to-SQL：问题 + schema（真实表头/样例）→ LLM 生成 SELECT
 sql_gen_prompt = ChatPromptTemplate.from_messages([
@@ -693,24 +786,25 @@ def format_sql_result(cols, rows):
     return "\n".join(parts)
 
 
-def sql_answer(question):
-    """SQL 链：生成 SQL → 执行 → 报错重写 1 次；空结果/失败返回 None 由门面降级。"""
-    schema = db.schema_text()
-    sql = (sql_gen_prompt | llm | StrOutputParser()).invoke(
+def sql_answer(question, llm_obj, db_obj):
+    """SQL 链：生成 SQL → 执行 → 报错重写 1 次；空结果/失败返回 None 由门面降级。
+    llm_obj / db_obj 由调用方注入（默认走全局，测试可传 mock，省真实 API 调用）。"""
+    schema = db_obj.schema_text()
+    sql = (sql_gen_prompt | llm_obj | StrOutputParser()).invoke(
         {"question": question, "schema": schema}
     ).strip()
     print(f"  [SQL 链] 生成的 SQL：{sql}")
     if sql.upper() == "NULL":
         return None  # LLM 判断与表无关
     try:
-        cols, rows = db.query(sql)
+        cols, rows = db_obj.query(sql)
     except Exception as e:
-        retry = (sql_retry_prompt | llm | StrOutputParser()).invoke(
+        retry = (sql_retry_prompt | llm_obj | StrOutputParser()).invoke(
             {"question": question, "schema": schema, "sql": sql, "error": str(e)}
         ).strip()
         print(f"  [SQL 链] 重写：{retry}")
         try:
-            cols, rows = db.query(retry)
+            cols, rows = db_obj.query(retry)
         except Exception as e2:
             print(f"  [SQL 链] 重写后仍失败，降级向量检索：{e2}")
             return None
@@ -719,20 +813,65 @@ def sql_answer(question):
     return format_sql_result(cols, rows)
 
 
-def ask(question):
-    """门面：单一入口。路由器分流 vector/sql，SQL 失败自动降级向量链。"""
-    route = router_chain.invoke({"question": question}).strip()
+def init():
+    """初始化所有重资源（幂等）：嵌入模型 → 向量库（首次全量/增量）→ 检索器 → LLM → SQLite → 链。
+
+    import rag 不自动执行本函数（顶层零副作用）；调用时机：
+    - app.py 启动时（lifespan）调用一次；
+    - rag.py CLI 入口进入前调用；
+    - 测试 import rag 后可跳过（测纯函数不需要这些对象）。
+    """
+    global embeddings, vector_store, llm, db, retriever, chain, router_chain
+    if embeddings is None:
+        embeddings = HuggingFaceEmbeddings(
+            model_name=os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5"),
+        )
+    if vector_store is None:
+        vector_store = _build_vector_store()
+    if llm is None:
+        llm = ChatOpenAI(
+            base_url=os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1"),
+            model=os.getenv("LLM_MODEL", "deepseek-chat"),
+            temperature=0.3,
+        )
+    if db is None:
+        db = SQLiteDb()
+    if retriever is None:
+        retriever = _build_retrievers(vector_store, llm)
+    if chain is None:
+        chain = build_qa_chain(llm, retriever)
+    if router_chain is None:
+        router_chain = router_prompt | llm | StrOutputParser()
+
+
+def ask(question, *, llm=None, retriever=None, db=None):
+    """门面：单一入口。路由器分流 vector/sql，SQL 失败自动降级向量链。
+
+    支持依赖注入（测试用）：传 llm / retriever / db 时用给定对象重建链路
+    （build_qa_chain + router_prompt），不污染全局；默认 None 走 init() 的全局对象。
+    """
+    if llm is None and retriever is None and db is None:
+        _llm, _db = globals()["llm"], globals()["db"]
+        _chain, _router = chain, router_chain
+    else:
+        _llm = llm or globals()["llm"]
+        _retriever = retriever or globals()["retriever"]
+        _db = db or globals()["db"]
+        _chain = build_qa_chain(_llm, _retriever)
+        _router = router_prompt | _llm | StrOutputParser()
+    route = _router.invoke({"question": question}).strip()
     print(f"  [路由器] 问题类型：{route}")
     if route == "sql":
-        ans = sql_answer(question)
+        ans = sql_answer(question, _llm, _db)
         if ans is not None:
             return ans
         print("  [路由器] SQL 链无结果，降级向量检索")
-    return chain.invoke({"question": question}).content
+    return _chain.invoke({"question": question}).content
 
 
 # ========== 7. 运行 ==========
 if __name__ == "__main__":
+    init()  # CLI 入口显式初始化（import 不再自动构建索引）
     question = input("请输入你的问题（关于知识库内容）：")
     response = ask(question)
     print(f"\n回答：{response}")

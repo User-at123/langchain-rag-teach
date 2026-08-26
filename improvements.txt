@@ -354,13 +354,17 @@ LangChain 教学项目 · 可改进方向与思路笔记
    - LLM Agent 根据问题自主决定调用哪个工具、按需组合多步
    - 场景："先统计各行业客户数，再针对最多的行业生成一句话介绍"这类多跳问题
 
-[待做] 规划 A：依赖解耦重构（2026-08 记录，待实施；详情见 mindmap V8+ 规划 A）
+[已完成] 规划 A：依赖解耦重构（V10.1，2026-08-26 实施；详情见 mindmap V10.1）
    - 动机：langchain-community 已官宣 sunset（rag.py 运行即警告）；
      BM25Retriever 参数名随版本变过（preprocess_func vs tokenizer），薄封装最易踩版本坑
    - 决策：LCEL 管道（langchain-core）不重写，保留声明式写法（见 mindmap 核心概念 8）
-   - 改动清单：手写 TextLoader / PyPDFLoader（pymupdf）/ CSVLoader / Docx2txtLoader /
-     BM25Retriever（rank-bm25 + jieba），共约 60~80 行
-   - 效果：langchain-community / pypdf / docx2txt 依赖全部消失，sunset 风险清零
+   - 改动清单：手写 TextLoader（open 读）/ PyPDFLoader（pymupdf get_text）/
+     CSVLoader（csv.DictReader）/ Docx2txtLoader（zipfile 解 document.xml）/
+     BM25Retriever（rank_bm25 + jieba，继承 BaseRetriever 保持管道兼容）
+   - 配套：rag.py 顶层重活包进 init()（import 零副作用）；ask() 支持注入
+     llm/retriever/db；app.py 用 lifespan 调 init()；tests/ 引入 pytest
+   - 效果：langchain-community / pypdf / docx2txt 依赖全部移除，sunset 风险清零
+   - 验证：pytest 24 用例全绿 + 真实链路冒烟（2541 片段不变）+ Web 启动正常
 
 [已完成] 规划 B：增量索引（V8.1，2026-08-25 实施；详情见 mindmap V8.1 / 核心概念 11）
    - 痛点：chroma_db 存在直接加载、不存在全量重建，加新文件必须删库重建；
