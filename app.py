@@ -15,6 +15,7 @@
 """
 
 import os
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -40,10 +41,12 @@ app = FastAPI(title="RAG 知识库问答", version="1.0.0", lifespan=lifespan)
 
 class AskRequest(BaseModel):
     question: str
+    session_id: str | None = None  # 可选：前端生成的会话 ID（多轮记忆用）
 
 
 class AskResponse(BaseModel):
     answer: str
+    session_id: str  # 回传会话 ID：首次未传时由后端生成，前端沿用实现多轮记忆
 
 
 def _render_index() -> str:
@@ -67,16 +70,17 @@ def health():
 
 @app.post("/ask", response_model=AskResponse)
 def ask_endpoint(req: AskRequest):
-    """核心接口：问题交给 ask() 门面，路由器自动分流 vector / sql。"""
+    """核心接口：问题交给 ask() 门面，三路路由器自动分流 vector / sql / memory。"""
     question = req.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="问题不能为空")
+    sid = req.session_id or uuid.uuid4().hex  # 首次提问由后端生成会话 ID
     try:
-        answer = ask(question)
+        answer = ask(question, session_id=sid)
     except Exception as e:
         # LLM 余额不足（402）、网络异常等：返回友好提示，而不是 500 堆栈
         raise HTTPException(status_code=500, detail=f"服务暂时不可用：{e}")
-    return AskResponse(answer=answer)
+    return AskResponse(answer=answer, session_id=sid)
 
 
 if __name__ == "__main__":

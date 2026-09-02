@@ -22,7 +22,7 @@ python app.py    # 直接启动（等价于下面 uvicorn 命令，端口默认 
 # 本机打开 http://127.0.0.1:8000 ；其他设备打开 http://<本机局域网IP>:8000
 # （Windows 防火墙首次弹窗请允许放行 8000 端口）
 
-# 5. 运行回归测试（V10.1：pytest，tests/ 24 个用例，无需真实 API、不建索引）
+# 5. 运行回归测试（V12.0：pytest，tests/ 34 个用例，无需真实 API、不建索引）
 python -m pytest
 ```
 
@@ -141,13 +141,13 @@ V8.1 起会自动增量更新：启动时比对 `.index_state.json` 里的文件
 | 文件 | 作用 |
 | --- | --- |
 | `main.py` | 普通问答：加载配置 → 创建模型 → 定义提示词 → 组合成链 → 运行 |
-| `rag.py` | RAG 问答：多格式知识库 → 切分 → 嵌入 → Chroma 检索 → 生成；V9.0 起入口 `ask()` 带 LLM 路由器（vector/sql）分流；V10.1 起加载器/BM25 全部手写（去掉 langchain-community）、顶层重活包进 `init()`、`ask()` 支持依赖注入 |
+| `rag.py` | RAG 问答：多格式知识库 → 切分 → 嵌入 → Chroma 检索 → 生成；V9.0 起入口 `ask()` 带 LLM 路由器（vector/sql）分流；V10.1 起加载器/BM25 全部手写（去掉 langchain-community）、顶层重活包进 `init()`、`ask()` 支持依赖注入；V11.0 起 `ask()` 加 `session_id` 多轮记忆（memory 路）；V12.0 起路由器四路（+agent）手写 ReAct 循环（query_sql / retrieve_vector / read_memory 三工具） |
 | `sql_db.py` | Text-to-SQL 数据层（V9.0）：xlsx → SQLite 建库导入 + 只读 SELECT 执行器 + 中文列名校验 + schema 文本生成（零新增依赖）；V10.0 起支持跨线程（FastAPI 线程池） |
 | `app.py` | Web 服务（V10.0）：`POST /ask` 复用 `ask()` 门面 + `GET /` 前端页面 + `GET /health` 健康检查 |
 | `templates/index.html` | 极简深色前端页面（V10.0）：单文件内嵌 CSS/JS，移动端适配，fetch 调 `/ask` |
 | `knowledge_base.txt` | 单文件知识库（docs/ 为空时的回退来源） |
 | `docs/` | 多格式知识库目录（txt/md/pdf/docx/csv/xlsx） |
-| `tests/` | pytest 回归测试（V10.1）：sql_db 校验 / rag 纯函数 / app 接口 / ask mock 链路，共 24 个用例，无需真实 API |
+| `tests/` | pytest 回归测试（V12.0）：sql_db 校验 / rag 纯函数 / app 接口 / ask mock 链路 / 多轮记忆（V11.0）/ Agent 编排（V12.0），共 34 个用例，无需真实 API |
 | `pytest.ini` | pytest 配置（V10.1）：指定 tests/ 目录 + 项目根可导入 |
 | `requirements.txt` | 依赖清单 |
 | `.env.example` | 环境变量模板（复制为 `.env` 后填写） |
@@ -173,7 +173,7 @@ RAG = 检索（Retrieval）+ 增强（Augmented）+ 生成（Generation），
 | 存储 | `Chroma` | 向量库，索引落盘到 `./chroma_db`；V8.1 起增量维护（`.index_state.json` 记录文件指纹，启动只处理新增/变更/删除的文件；BM25 每次从向量库取回文本重建） |
 | 检索 | `retriever`（V8.2 MultiQuery 多路检索：LLM 拆子查询 → 每路 BM25+向量 RRF 召回 → bge-reranker 精排 → rank 融合合并） | 解决"枚举/集合类问题"（有几个/都有谁）单路检索漏全集：一个问法只匹配一种"说法"，多路拆解覆盖不同说法后合并（实例：李云龙两任妻子 秀芹+田雨 都能召回）。每路内部仍是 BM25 关键词 + 向量语义 + RRF 融合 + reranker 精排。局限：万级全量列举/统计类问题仍靠 SQL（见 mindmap 核心概念 6） |
 | 增强 | 把 `{context}` 塞进提示词 | 让模型"带着资料"作答，并标注来源 |
-| 路由 | `ask()` 门面 + `router_chain`（V9.0） | LLM 判断问题类型：事实查询走检索链，列举/统计/聚合走 SQL 链（`sql_db.py`），SQL 失败自动降级检索链 |
+| 路由 | `ask()` 门面 + `router_chain`（V9.0；V11.0 三路 +memory，V12.0 四路 +agent） | LLM 判断问题类型：事实查询走检索链，列举/统计/聚合走 SQL 链（`sql_db.py`），引用上轮走 memory（会话记忆 + 跨轮状态），多跳/组合走 agent（手写 ReAct 循环三工具自主编排），SQL 失败/Agent 异常自动降级检索链 |
 | 服务封装 | `app.py`（V10.0）：FastAPI 起服务，`POST /ask` 复用 `ask()` 门面 | 把 CLI 问答变成 Web 接口，`--host 0.0.0.0` 后局域网可访问；SQLite 跨线程用 `check_same_thread=False` + 锁保证安全 |
 
 **建议体验**：先用 `main.py` 问"星辰科技是哪年成立的"（模型不知道，会编造），

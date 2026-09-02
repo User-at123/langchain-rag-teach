@@ -6,6 +6,7 @@
 
 import json
 import os
+import re
 
 import jieba
 
@@ -28,6 +29,7 @@ from rank_bm25 import BM25Okapi  # 手写 BM25 检索器用（替代已停维护
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.retrievers import BaseRetriever
@@ -534,12 +536,13 @@ class MultiQueryRetriever(BaseRetriever):
     base_retriever: BaseRetriever = Field(description="粗召回检索器（RRF 混合检索）")
     llm: Any = Field(description="生成子查询的 LLM（一次调用生成多路）")
     sub_query_count: int = Field(default=5, description="拆成几路子查询")
-    per_query_top_n: int = Field(default=4, description="每路子查询精排后保留条数（给弱相关但关键的信息留空间）")
+    per_query_top_n: int = Field(default=5, description="每路子查询精排后保留条数（给弱相关但关键的信息留空间）")
     recall_top_n: int = Field(
-        default=20,
-        description="每路子查询粗召回条数。精排只取前 per_query_top_n 条进最终视野，"
-        "召回 50 条纯属浪费——reranker 是本地 CPU 交叉编码器，50 条/路 × 5 路 = 250 对"
-        "要算 ~25 秒（实测），砍到 20 条/路 = 100 对 ≈ 11 秒，质量不变（V8.2 性能优化）",
+        default=30,
+        description="每路子查询粗召回条数。V11.1 实测：抽象问法（结局/下场）改写出的"
+        "「田雨 自杀」单路在 RRF 全量排第 23，recall_top_n=20 会把它截断丢关键信息；"
+        "提到 30 兜住罕见词 chunk。30 条/路 × 5 路去重后 ≈ 150 对精排 ≈ 15s（本地实测），"
+        "与旧版 20 条/路耗时相当（瓶颈在 reranker 首轮，去重后对数量增长有限）。",
     )
     top_n: int = Field(default=6, description="最终进 LLM 视野的条数")
     model_name: str = Field(
@@ -572,8 +575,26 @@ class MultiQueryRetriever(BaseRetriever):
             "（如\"李云龙第一任妻子 杨秀芹\"、\"李云龙第二任妻子 田雨\"）；\n"
             "2. 每个子查询只聚焦一个对象/一个说法，不要在一个子查询里混多个名字；\n"
             "3. 可补充\"关系式\"问法（如\"杨秀芹和李云龙是什么关系\"），绕开原问题里的关键词；\n"
-            "4. 每个子查询包含足够上下文词，能独立完成检索；\n"
-            "5. 只返回 JSON 数组字符串（如 [\"子查询1\", \"子查询2\", ...]），不要任何其他文字。\n\n"
+            "4. 抽象问法必须具象化（做\"方向拆解\"）：用户可能用抽象/概括的说法询问（如某人的"
+            "结局/下场/命运/后来如何、内心情感/心情、一段关系/爱情的发展、某人的去向/下落、"
+            "某段际遇/事业/财产/战斗结果等）。对这类说法，请像一位熟悉作品的读者那样，"
+            "预想原文更可能用哪些具体词/情节/情境来表达这个抽象概念（不局限于以下示例，"
+            "凡抽象概括处都应如此预想）：\n"
+            "   - 结局/命运 → 死亡/自杀/牺牲/去世/被捕/归隐/下落不明…\n"
+            "   - 心情/情绪 → 愤怒/悲痛/得意/沉默/流泪/狂喜…\n"
+            "   - 爱情/关系 → 结婚/表白/离婚/分手/私奔/反目…\n"
+            "   - 去向/下落 → 被俘/阵亡/逃亡/回家/奔赴…\n"
+            "   - 婚姻/事业/战斗结果 → 结婚/离婚 或 升迁/贬职 或 胜利/战败…\n"
+            "然后把这些预想的具体词分散到不同子查询，每个方向各写一路，不要所有子查询都共用"
+            "同一个具体词——方向随问题自由预想，不局限于本示例；\n"
+            "5. 死亡/生命状态类是方向拆解的重要案例（易漏高价值）：对结局/下场/命运/后来怎么样等"
+            "死亡类抽象词，必须同时覆盖正常死亡（去世/病故/终老）与非正常死亡（自杀/牺牲/被杀/"
+            "处决/自尽）两个方向，各成一路——答案往往藏在非正常死亡的原文写法里，"
+            "只联想\"去世\"这类通用词命不中；\n"
+            "6. 至少保留一路子查询直接使用原问题的原始关键词（防止改写丢失原文信息）；\n"
+            "7. 专有名词（人名/地名/机构名/作品名）必须原样带上，不得省略或改写；\n"
+            "8. 每个子查询包含足够上下文词，能独立完成检索；\n"
+            "9. 只返回 JSON 数组字符串（如 [\"子查询1\", \"子查询2\", ...]），不要任何其他文字。\n\n"
             f"用户问题：{query}"
         )
         resp = self.llm.invoke(prompt)
@@ -603,12 +624,37 @@ class MultiQueryRetriever(BaseRetriever):
 
     def _get_relevant_documents(self, query: str, *, run_manager: Any = None):
         sub_queries = self._generate_sub_queries(query)
+        # 并行粗召回（V10.3 性能优化）：多路子查询互相独立，串行会白白累加等待时间。
+        # 第一个子查询在主线程先跑——顺带触发 BM25 懒索引构建（jieba 分词 2541 片段），
+        # 避免多线程同时首调导致重复构建 + GIL 争抢；其余子查询交线程池并行
+        # （本地 BM25/Chroma 在 native 调用处会释放 GIL，实际省大部分串行时间）。
+        from concurrent.futures import ThreadPoolExecutor
+
+        route_results = {}
+        if sub_queries:
+            first = sub_queries[0]
+            try:
+                route_results[first] = self.base_retriever.invoke(first)[: self.recall_top_n]
+            except Exception as e:
+                print(f"  [检索] 子查询「{first}」失败，忽略：{e}")
+                route_results[first] = []
+        with ThreadPoolExecutor(max_workers=min(4, max(1, len(sub_queries) - 1))) as pool:
+            futures = {
+                pool.submit(self.base_retriever.invoke, sq): sq
+                for sq in sub_queries[1:]
+            }
+            for fut, sq in futures.items():
+                try:
+                    route_results[sq] = fut.result()[: self.recall_top_n]
+                except Exception as e:
+                    print(f"  [检索] 子查询「{sq}」失败，忽略：{e}")
+                    route_results[sq] = []
         # 每路粗召回，收集 (子查询, Document) 对；跨路去重：同一 page_content 只保留一次
         collected = []
         seen = set()
         raw_count = 0
         for sq in sub_queries:
-            for doc in self.base_retriever.invoke(sq)[: self.recall_top_n]:
+            for doc in route_results.get(sq, []):
                 raw_count += 1
                 if doc.page_content in seen:
                     continue  # 已被其他子查询召回，跳过
@@ -681,8 +727,12 @@ def _build_retrievers(vs, llm_obj):
         base_retriever=ensemble_retriever,
         llm=llm_obj,
         sub_query_count=5,
-        per_query_top_n=3,
-        top_n=6,
+        per_query_top_n=5,  # V11.1：3→5，精排后每路多留 2 条，给"弱相关但关键"的罕见词 chunk 留空间
+        recall_top_n=30,  # V11.1：15→30。实测「田雨 结局 自杀」单路 RRF 排第 25，15 会截断丢答案；
+        # 30 条/路 × 5 路去重后约 150 对精排 ≈ 15s（V10.3 曾砍到 15 省 ~2s，但牺牲了召回，回调）
+        top_n=8,  # V11.1.3：6→8。实测「田雨死了吗」割腕 chunk 精排第 2（分 0.94）但只在一路出现，
+        # RRF 融合分 1/62 排第 7——top6 被"多路同现"的常规 chunk 占满，关键 chunk 卡在第 7 被截断。
+        # 8 条视野对"只在一路出现但高度相关"的 chunk 更宽容；LLM 上下文仅多 ~1k 字（deepseek 可承受）
     )
 
 # ========== 5. 提示词 ==========
@@ -728,19 +778,31 @@ retriever = None  # init() 中构建（MultiQueryRetriever 实例）
 db = None          # init() 中创建（SQLiteDb 实例）
 router_chain = None  # init() 中构建（router_prompt | llm | StrOutputParser）
 
-# 6.5.1 路由器：判断问题走 vector（文档检索）还是 sql（数据库查询）
+# 6.5.1 路由器：判断问题走 vector（文档检索）/ sql（数据库查询）/ memory（结合对话历史）
+#   / agent（多跳任务自主编排）
+# V11.0（第 9 步）新增 memory 路：历史上下文只在判断时提供给 LLM，不参与 vector/sql 的回答
+# V12.0（第 10 步）新增 agent 路：多步/组合问题交给 Agent 循环（三个工具自主编排），
+#   路由器从"唯一决策者"降级为"调度员"——单跳走快路径，多跳进 Agent，Agent 失败回退快路径
 router_prompt = ChatPromptTemplate.from_messages([
     ("system",
-     "你是问题路由器。判断用户问题应该走哪条查询路径，只返回一个词：vector 或 sql。\n\n"
+     "你是问题路由器。判断用户问题应该走哪条查询路径，只返回一个词：vector、sql、memory 或 agent。\n\n"
      "- vector：答案在叙述性文档里（问属性/关系/定义/背景），读几段原文就能答；\n"
      "  例如\"华信银行的行业是什么\"、\"李云龙的妻子是谁\"。\n"
      "- sql：需要对表格数据做列举/统计/聚合/排名，必须查数据库才能答；\n"
-     "  例如\"所有客户的行业有哪些\"、\"客户总数是多少\"、\"各行业客户数量排名\"。\n\n"
+     "  例如\"所有客户的行业有哪些\"、\"客户总数是多少\"、\"各行业客户数量排名\"。\n"
+     "- memory：问题引用了本对话之前的内容（指代、追问，或\"刚才/上轮/之前/第 X 条\"），\n"
+     "  只有结合对话历史才能理解；例如\"那她们结局如何\"、\"刚才结果里金融客户有谁\"。\n"
+     "- agent：需要多步/组合才能完成（先查再分析、结合文档与表格、先统计再总结），\n"
+     "  单条路径的固定链路不够用；例如\"先统计各行业客户数，再针对最多的行业生成一句话介绍\"。\n\n"
      "判断规则：\n"
-     "1. 出现统计/聚合词（多少/几个/总数/合计/平均/最大/最小/排行/排名/占比）→ sql\n"
-     "2. 出现全集列举词（所有/全部/每个/各自/名单/明细/清单）→ sql\n"
-     "3. 其余（是什么/怎么样/为什么/谁/关系/约定/条款）→ vector\n"
-     "4. 不确定时默认 vector（文档检索覆盖面更广，SQL 只覆盖表格数据）"),
+     "1. 含多步/组合信号（先…再/然后/接着/结合…与…/分别…并…/既…又…）→ agent\n"
+     "2. 出现统计/聚合词（多少/几个/总数/合计/平均/最大/最小/排行/排名/占比）→ sql\n"
+     "3. 出现全集列举词（所有/全部/每个/各自/名单/明细/清单）→ sql\n"
+     "4. 问题含指代（她们/他们/它/这个/那个/刚才/上轮/之前/结果/第X条/那...）\n"
+     "   且下方对话历史非空 → memory\n"
+     "5. 其余（是什么/怎么样/为什么/谁/关系/约定/条款）→ vector\n"
+     "6. 不确定时默认 vector（文档检索覆盖面更广，SQL 只覆盖表格数据）\n\n"
+     "对话历史（仅用于判断是否引用上轮，不要用它回答问题）：\n{history_hint}"),
     ("human", "{question}"),
 ])
 # router_chain 在 init() 中构建（依赖 llm）：
@@ -813,6 +875,234 @@ def sql_answer(question, llm_obj, db_obj):
     return format_sql_result(cols, rows)
 
 
+# ========== 6.7 多轮记忆 + 跨轮状态（第 9 步） ==========
+# 会话存储：内存 dict（本地单进程够用；与回答缓存同生命周期，重启即失）
+# 每个 session_id 维护：
+#   history: [(role, text), ...]——最近 MAX_HISTORY_ROUNDS 轮对话（补全器的原料）
+#   last_result: 最近一次 SQL 查询结果的文本（跨轮状态：追问"刚才结果里..."直接取用，不重查库）
+sessions: dict = {}
+MAX_HISTORY_ROUNDS = 6
+
+
+def _session(session_id):
+    return sessions.setdefault(session_id, {"history": [], "last_result": None})
+
+
+# 6.7.1 记忆补全器：把"引用上轮"的问题改写成自包含问题，并判断重写后走哪条路
+memory_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "你是对话记忆处理器。用户在多轮对话中，当前问题可能引用之前的对话内容"
+     "（指代词如\"她们/它们/它/这个/那个/刚才/上轮/第 X 条\"）。\n\n"
+     "最近对话历史：\n{history}\n\n"
+     "上轮查询结果（若本轮直接引用它，这里会有内容）：\n{last_result}\n\n"
+     "请把当前问题改写成脱离上下文也能独立理解的完整问题，并判断重写后的问题"
+     "应该怎么回答。只返回一行 JSON，不要任何其他文字，格式为：\n"
+     '{{"rewritten": "重写后的完整问题", "base": "vector" 或 "sql" 或 "last_result"}}\n\n'
+     "- base=vector：答案在文档资料里（问属性/关系/背景），重写后走文档检索；\n"
+     "- base=sql：需要查数据库做列举/统计/聚合，重写后走数据库查询；\n"
+     "- base=last_result：上轮查询结果里直接有答案（如\"刚才的结果\"、\"第 X 条\"），\n"
+     "  此时 rewritten 给原问题即可，不用重写。\n\n"
+     "示例：\n"
+     "历史：user：李云龙的妻子是谁？assistant：李云龙的两位妻子是杨秀芹和田雨。\n"
+     "当前问题：那她们结局如何？\n"
+     '输出：{{"rewritten": "李云龙的两位妻子杨秀芹和田雨的结局如何？", "base": "vector"}}'),
+    ("human", "{question}"),
+])
+
+# 6.7.2 基于上轮结果直接回答（base=last_result，不再检索/查库）
+qa_from_result_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "你是助手。用户引用了上一轮的查询结果，请直接基于下面的【上轮结果】回答，"
+     "不要虚构结果里没有的信息。\n\n"
+     "【上轮结果】\n{result}"),
+    ("human", "{question}"),
+])
+
+
+def _parse_memory_plan(text):
+    """解析补全器输出的 JSON {rewritten, base}；失败返回 None（调用方降级走普通路由）。"""
+    import json
+    import re
+
+    def _try(t):
+        data = json.loads(t)
+        if not isinstance(data, dict):
+            return None
+        rewritten = str(data.get("rewritten", "")).strip()
+        base = data.get("base", "vector")
+        if not rewritten:
+            return None
+        if base not in ("vector", "sql", "last_result"):
+            base = "vector"
+        return rewritten, base
+
+    try:
+        plan = _try(text)
+        if plan:
+            return plan
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", text, re.S)  # 容忍模型输出前后夹杂说明文字
+    if m:
+        try:
+            plan = _try(m.group(0))
+            if plan:
+                return plan
+        except Exception:
+            pass
+    return None
+
+
+def _answer_with_memory(question, session, _llm, _db, _chain, _router):
+    """memory 路由：补全器改写问题 → 按 base 分流（vector / sql / last_result）。"""
+    pairs = session["history"][-MAX_HISTORY_ROUNDS * 2:]
+    history = "\n".join(f"{role}：{text}" for role, text in pairs) or "（无历史）"
+    last_result = session.get("last_result") or "（无）"
+    resp = (memory_prompt | _llm | StrOutputParser()).invoke({
+        "question": question,
+        "history": history,
+        "last_result": last_result,
+    }).strip()
+    print(f"  [记忆] 补全器输出：{resp}")
+    plan = _parse_memory_plan(resp)
+    if plan is None:
+        print("  [记忆] 补全器输出无法解析，按普通问题走完整路由")
+        return _run_route(question, _llm, _db, _chain, _router, history_hint=history)
+    rewritten, base = plan
+    if base == "last_result" and session.get("last_result"):
+        print("  [记忆] 直接基于上轮结果回答（不检索、不查库）")
+        return (qa_from_result_prompt | _llm | StrOutputParser()).invoke({
+            "question": question,
+            "result": session["last_result"],
+        })
+    if base == "sql":
+        ans = sql_answer(rewritten, _llm, _db)
+        if ans is not None:
+            return ans
+        print("  [记忆] SQL 链无结果，降级向量检索")
+    return _chain.invoke({"question": rewritten}).content
+
+
+def _run_route(question, _llm, _db, _chain, _router, history_hint=""):
+    """单次 vector/sql 分流并返回回答文本（memory 路不在此处理，由 ask 外层接管）。"""
+    route = _router.invoke({"question": question, "history_hint": history_hint}).strip()
+    print(f"  [路由器] 问题类型：{route}")
+    if route == "sql":
+        ans = sql_answer(question, _llm, _db)
+        if ans is not None:
+            return ans
+        print("  [路由器] SQL 链无结果，降级向量检索")
+    return _chain.invoke({"question": question}).content
+
+
+# ========== 6.8 Agent 工具化（第 10 步） ==========
+# 手写 ReAct 循环（零新增依赖，不引 langgraph）：把 query_sql / retrieve_vector /
+# read_memory 封装成工具，LLM 在 Thought→Action→Observation 循环里自主编排多步。
+# 路由器负责"什么时候进 Agent"（多跳信号），Agent 负责"多步怎么走"。
+MAX_AGENT_STEPS = 4  # 防死循环：超过步数仍未输出 Final Answer 就回退快路径
+
+AGENT_SYSTEM = (
+    "你是自主 Agent，负责拆解需要多步才能完成的任务。你有三个工具，按需调用、可多次组合：\n\n"
+    "- query_sql(问题)：把问题转成 SQLite SELECT 语句并执行，返回结果文本。\n"
+    "  适合统计/列举/聚合（多少/几个/总数/排名/有哪些）。\n"
+    "- retrieve_vector(问题)：检索知识库文档并生成回答。\n"
+    "  适合属性/关系/背景类事实问题（是什么/谁/为什么）。\n"
+    "- read_memory()：读取本会话的历史对话与上轮查询结果。\n"
+    "  追问/引用上轮内容时先用它取上下文。\n\n"
+    "每轮输出必须是以下两种格式之一（不要输出其他文字）：\n"
+    "Action: 工具名\n"
+    "Action Input: 参数\n\n"
+    "或者任务完成时输出：\n"
+    "Final Answer: 最终回答\n\n"
+    "规则：\n"
+    "1. 先分析任务分几步，每步选最合适的工具；\n"
+    "2. 工具结果会作为 Observation 返回给你，看到 Observation 再决定下一步；\n"
+    "3. 任务完成立刻输出 Final Answer，不要多余动作；\n"
+    "4. 工具都无法解决时，在 Final Answer 里如实说明。"
+)
+
+
+def _extract_final(text):
+    """提取 Final Answer 后面的内容；没有则返回 None。"""
+    m = re.search(r"(?:Final Answer|最终答案)\s*[：:]\s*(.+)", text, re.S)
+    return m.group(1).strip() if m else None
+
+
+def _parse_action(text):
+    """解析 Action / Action Input 两行；缺 Action 返回 (None, None)。"""
+    am = re.search(r"Action\s*[：:]\s*(\w+)", text)
+    im = re.search(r"Action Input\s*[：:]\s*(.+)", text, re.S)
+    if not am:
+        return None, None
+    name = am.group(1).strip()
+    arg = im.group(1).strip() if im else ""
+    return name, arg
+
+
+def _format_session_context(session):
+    """read_memory 工具：把会话历史 + 上轮结果拼成给 Agent 的上下文文本。"""
+    if session is None:
+        return "（无会话上下文）"
+    history = "\n".join(
+        f"{role}：{text}" for role, text in session["history"][-MAX_HISTORY_ROUNDS * 2:]
+    ) or "（无历史）"
+    last = session.get("last_result") or "（无）"
+    return f"对话历史：\n{history}\n\n上轮查询结果：\n{last}"
+
+
+def _call_agent_tool(name, arg, _llm, _db, _chain, session):
+    """调度三个 Agent 工具，返回 Observation 文本。"""
+    if name == "query_sql":
+        if _db is None:
+            return "（数据库不可用，无法执行查询）"  # 注入模式未传 db 时不崩，由 Agent/门面降级
+        ans = sql_answer(arg, _llm, _db)
+        if ans is not None and session is not None:
+            session["last_result"] = ans  # 同步跨轮状态，Agent 后续 read_memory 能读到本轮结果
+        return ans if ans is not None else "（SQL 查询无结果：该问题可能不在数据库表格数据中）"
+    if name == "retrieve_vector":
+        return _chain.invoke({"question": arg}).content
+    if name == "read_memory":
+        return _format_session_context(session)
+    return f"（未知工具 {name}，可用：query_sql / retrieve_vector / read_memory）"
+
+
+def _run_agent(question, _llm, _db, _chain, session):
+    """手写 ReAct 循环：Thought→Action→Observation 直到 Final Answer 或超步数。
+
+    每轮把完整对话（SystemMessage + 历史消息 + 新 Observation）直接传给 LLM，
+    循环由 LLM 的"看到 Observation 再决策"驱动；超步数或输出不可解析返回 None，
+    由 ask 门面回退快路径（_run_route），保证 Agent 异常不拖垮整个问答。
+    """
+    messages = [SystemMessage(content=AGENT_SYSTEM), HumanMessage(content=question)]
+    for step in range(1, MAX_AGENT_STEPS + 1):
+        resp = _llm(messages)  # __call__ 等价 invoke：真实 ChatOpenAI 与测试裸 callable 都兼容
+        text = resp.content if hasattr(resp, "content") else str(resp)
+        print(f"  [Agent 第 {step} 步] {text}")
+        final = _extract_final(text)
+        if final is not None:
+            return final
+        action, arg = _parse_action(text)
+        if action is None:
+            print("  [Agent] 输出无法解析，回退快路径")
+            return None
+        observation = _call_agent_tool(action, arg, _llm, _db, _chain, session)
+        print(f"  [Agent] 工具 {action} 观察结果：{observation[:80]}...")
+        messages.append(AIMessage(content=text))
+        messages.append(HumanMessage(content=f"Observation: {observation}\n看到结果后请继续（下一步 Action 或 Final Answer）"))
+    print(f"  [Agent] 超过 {MAX_AGENT_STEPS} 步未收敛，回退快路径")
+    return None
+
+
+def _record_session(session, question, response):
+    """把一轮问答写入会话（历史截断到 MAX_HISTORY_ROUNDS 轮）；SQL 结果暂存为跨轮状态。"""
+    session["history"].append(("user", question))
+    session["history"].append(("assistant", response))
+    if len(session["history"]) > MAX_HISTORY_ROUNDS * 2:
+        del session["history"][: len(session["history"]) - MAX_HISTORY_ROUNDS * 2]
+    if response.startswith("[数据库查询]"):
+        session["last_result"] = response
+
+
 def init():
     """初始化所有重资源（幂等）：嵌入模型 → 向量库（首次全量/增量）→ 检索器 → LLM → SQLite → 链。
 
@@ -844,12 +1134,30 @@ def init():
         router_chain = router_prompt | llm | StrOutputParser()
 
 
-def ask(question, *, llm=None, retriever=None, db=None):
-    """门面：单一入口。路由器分流 vector/sql，SQL 失败自动降级向量链。
+_answer_cache: dict = {}  # V10.3：相同问题直接命中缓存秒回（本地运行，内存足够）
+_MAX_CACHE_SIZE = 64
 
-    支持依赖注入（测试用）：传 llm / retriever / db 时用给定对象重建链路
-    （build_qa_chain + router_prompt），不污染全局；默认 None 走 init() 的全局对象。
+
+def ask(question, *, session_id=None, llm=None, retriever=None, db=None):
+    """门面：单一入口。四路路由器分流 vector / sql / memory / agent（第 10 步 Agent 工具化）。
+
+    - vector：文档检索链；sql：Text-to-SQL 链（失败自动降级向量链）；
+    - memory：结合本会话历史回答——补全指代后重路由，或直接引用上轮 SQL 结果（跨轮状态）；
+    - agent：多跳/组合问题走手写 ReAct 循环（query_sql / retrieve_vector / read_memory 三工具），
+      Agent 未收敛或输出不可解析时回退快路径（_run_route），保证异常不拖垮问答；
+    - session_id 非 None 时启用会话记忆（历史 + 上轮结果暂存）；为 None 保持 V10 无记忆行为；
+    - 依赖注入（测试用）与无 session_id：不启用记忆，行为与 V10.3 完全一致（测试零影响）。
     """
+    injected = not (llm is None and retriever is None and db is None)
+    q = question.strip()
+    session = _session(session_id) if session_id is not None else None
+    if not injected:
+        hit = _answer_cache.get(q)
+        if hit is not None:
+            print(f"  [缓存] 命中相同问题（{len(_answer_cache)} 条缓存中），直接返回")
+            if session is not None:
+                _record_session(session, q, hit)  # 命中也要记账，追问指代才接得上
+            return hit
     if llm is None and retriever is None and db is None:
         _llm, _db = globals()["llm"], globals()["db"]
         _chain, _router = chain, router_chain
@@ -859,19 +1167,58 @@ def ask(question, *, llm=None, retriever=None, db=None):
         _db = db or globals()["db"]
         _chain = build_qa_chain(_llm, _retriever)
         _router = router_prompt | _llm | StrOutputParser()
-    route = _router.invoke({"question": question}).strip()
+
+    # 历史只喂给路由器判断"是否引用上轮"，不直接参与 vector/sql 链的回答
+    history_hint = ""
+    if session is not None:
+        history_hint = "\n".join(
+            f"{role}：{text}" for role, text in session["history"][-MAX_HISTORY_ROUNDS * 2:]
+        ) or "（无历史）"
+
+    route = _router.invoke({"question": q, "history_hint": history_hint}).strip()
     print(f"  [路由器] 问题类型：{route}")
-    if route == "sql":
-        ans = sql_answer(question, _llm, _db)
+    if route == "agent":
+        response = _run_agent(q, _llm, _db, _chain, session)
+        if response is None:  # Agent 未收敛/输出不可解析 → 回退快路径（路由器再判一次）
+            print("  [路由器] Agent 未收敛，回退快路径")
+            response = _run_route(q, _llm, _db, _chain, _router, history_hint=history_hint)
+    elif route == "memory" and session is not None:
+        response = _answer_with_memory(q, session, _llm, _db, _chain, _router)
+    elif route == "sql":
+        ans = sql_answer(q, _llm, _db)
         if ans is not None:
-            return ans
-        print("  [路由器] SQL 链无结果，降级向量检索")
-    return _chain.invoke({"question": question}).content
+            response = ans
+        else:
+            print("  [路由器] SQL 链无结果，降级向量检索")
+            response = _chain.invoke({"question": q}).content
+    else:
+        response = _chain.invoke({"question": q}).content
+
+    if session is not None:
+        _record_session(session, q, response)
+    if not injected:
+        if len(_answer_cache) >= _MAX_CACHE_SIZE:
+            _answer_cache.pop(next(iter(_answer_cache)))  # dict 保序，超限弹出最旧
+        _answer_cache[q] = response
+    return response
 
 
 # ========== 7. 运行 ==========
 if __name__ == "__main__":
     init()  # CLI 入口显式初始化（import 不再自动构建索引）
-    question = input("请输入你的问题（关于知识库内容）：")
-    response = ask(question)
-    print(f"\n回答：{response}")
+    print("多轮对话模式（第 9 步多轮记忆）：输入 exit / quit / 退出 结束")
+    print("可连续追问并用指代，如先问\"李云龙的妻子是谁？\"再问\"那她们结局如何？\"\n")
+    session_id = "cli"  # 固定会话：整个 CLI 进程内共享历史与上轮结果
+    while True:
+        try:
+            question = input("你：")
+        except (EOFError, KeyboardInterrupt):
+            print("\n再见")
+            break
+        q = question.strip()
+        if not q:
+            continue
+        if q.lower() in ("exit", "quit", "退出"):
+            break
+        response = ask(q, session_id=session_id)
+        print(f"回答：{response}\n")

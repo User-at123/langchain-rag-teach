@@ -101,6 +101,13 @@ const chat = document.getElementById('chat');
 const input = document.getElementById('q');
 const btn = document.getElementById('send');
 
+// 会话 ID：localStorage 持久化，刷新页面后多轮记忆仍延续（第 9 步）
+let sessionId = localStorage.getItem('rag_session_id');
+if (!sessionId) {
+  sessionId = 's-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+  localStorage.setItem('rag_session_id', sessionId);
+}
+
 function add(text, who) {
   const d = document.createElement('div');
   d.className = 'msg ' + who;
@@ -115,10 +122,10 @@ async function ask() {
   add(q, 'user');
   input.value = '';
 
-  // 占位气泡，等待结果
+  // 占位气泡，等待结果（检索+生成约需 10~20 秒，让用户有预期）
   const pending = document.createElement('div');
   pending.className = 'msg bot';
-  pending.textContent = '…';
+  pending.textContent = '正在检索知识库并生成回答（约 10~20 秒）…';
   chat.appendChild(pending);
   chat.scrollTop = chat.scrollHeight;
   btn.disabled = true;
@@ -127,9 +134,13 @@ async function ask() {
     const res = await fetch('/ask', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question: q })
+      body: JSON.stringify({ question: q, session_id: sessionId })
     });
     const data = await res.json();
+    if (data.session_id) {  // 首次提问后端可能新生成 ID，沿用并持久化
+      sessionId = data.session_id;
+      localStorage.setItem('rag_session_id', sessionId);
+    }
     pending.textContent = res.ok ? data.answer : ('出错了：' + (data.detail || res.status));
   } catch (e) {
     pending.textContent = '网络错误：' + e;
